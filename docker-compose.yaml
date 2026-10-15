@@ -1,0 +1,205 @@
+name: extractor
+
+x-firecrawl-env: &firecrawl-env
+  REDIS_URL: redis://redis:6379
+  REDIS_RATE_LIMIT_URL: redis://redis:6379
+  PLAYWRIGHT_MICROSERVICE_URL: http://firecrawl-playwright:3000/scrape
+  POSTGRES_USER: ${POSTGRES_USER:-postgres}
+  POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
+  POSTGRES_DB: ${POSTGRES_DB:-postgres}
+  POSTGRES_HOST: nuq-postgres
+  POSTGRES_PORT: "5432"
+  USE_DB_AUTHENTICATION: "false"
+  NUM_WORKERS_PER_QUEUE: ${NUM_WORKERS_PER_QUEUE:-8}
+  CRAWL_CONCURRENT_REQUESTS: ${CRAWL_CONCURRENT_REQUESTS:-10}
+  MAX_CONCURRENT_JOBS: ${MAX_CONCURRENT_JOBS:-5}
+  # Route Firecrawl's LLM features (/extract) to local Ollama — no OpenAI
+  OLLAMA_BASE_URL: http://ollama:11434
+  MODEL_NAME: ${LLM_MODEL:-qwen2.5:14b-instruct-q4_K_M}
+  MODEL_EMBEDDING_NAME: ${EMBED_MODEL:-bge-large}
+
+services:
+  # ---------- Ollama (LLM + embeddings, GPU) ----------
+  ollama:
+    image: ollama/ollama:latest
+    restart: unless-stopped
+    volumes:
+      - ollama-models:/root/.ollama
+    environment:
+      OLLAMA_KEEP_ALIVE: 30m
+      OLLAMA_NUM_PARALLEL: "4"
+      OLLAMA_MAX_LOADED_MODELS: "2"
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    healthcheck:
+      test: ["CMD", "ollama", "ps"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 10s
+
+  # One-shot: pulls the pinned models, then exits. `app` waits on this.
+  ollama-pull:
+    image: ollama/ollama:latest
+    restart: "no"
+    depends_on:
+      ollama:
+        condition: service_healthy
+    environment:
+      OLLAMA_HOST: http://ollama:11434
+      LLM_MODEL: ${LLM_MODEL:-qwen2.5:14b-instruct-q4_K_M}
+      EMBED_MODEL: ${EMBED_MODEL:-bge-large}
+    entrypoint: /bin/sh
+    command: -c 'ollama pull "$$LLM_MODEL" && ollama pull "$$EMBED_MODEL"'
+
+  # ---------- Firecrawl (self-hosted) ----------
+  firecrawl-api:
+    image: ghcr.io/firecrawl/firecrawl:latest
+    restart: unless-stopped
+    ulimits:
+      nofile:
+        soft: 65535
+        hard: 65535
+    environment:
+      <<: *firecrawl-env
+      HOST: "0.0.0.0"
+      PORT: "3002"
+      EXTRACT_WORKER_PORT: "3004"
+      WORKER_PORT: "3005"
+      NUQ_RABBITMQ_URL: amqp://rabbitmq:5672
+      ENV: local
+    command: node dist/src/harness.js --start-docker
+    depends_on:
+      redis:
+        condition: service_started
+      firecrawl-playwright:
+        condition: service_started
+      rabbitmq:
+        condition: service_healthy
+      nuq-postgres:
+        condition: service_healthy
+    healthcheck:
+      test:
+        - CMD
+        - node
+        - -e
+        - "require('http').get('http://localhost:3002/', () => process.exit(0)).on('error', () => process.exit(1))"
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 30s
+
+  firecrawl-playwright:
+    image: ghcr.io/firecrawl/playwright-service:latest
+    restart: unless-stopped
+    environment:
+      PORT: "3000"
+      BLOCK_MEDIA: "true"
+      MAX_CONCURRENT_PAGES: ${CRAWL_CONCURRENT_REQUESTS:-10}
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    tmpfs:
+      - /tmp/.cache:noexec,nosuid,size=1g
+
+  redis:
+    image: redis:alpine
+    restart: unless-stopped
+    command: redis-server --bind 0.0.0.0
+
+  rabbitmq:
+    image: rabbitmq:3-management
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "check_running"]
+      interval: 5s
+      timeout: 5s
+      retries: 6
+      start_period: 10s
+
+  # ---------- MongoDB (corpus store) ----------
+  mongo:
+    image: mongo:7
+    restart: unless-stopped
+    environment:
+      MONGO_INITDB_ROOT_USERNAME: ${MONGO_USER:-extractor}
+      MONGO_INITDB_ROOT_PASSWORD: ${MONGO_PASSWORD:-extractor}
+    volumes:
+      - mongo-data:/data/db
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - >-
+          mongosh --quiet
+          'mongodb://$$MONGO_INITDB_ROOT_USERNAME:$$MONGO_INITDB_ROOT_PASSWORD@localhost:27017/admin'
+          --eval 'quit(db.adminCommand({ping:1}).ok ? 0 : 2)'
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 10s
+
+  nuq-postgres:
+    image: ghcr.io/firecrawl/nuq-postgres:latest
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-postgres}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
+      POSTGRES_DB: ${POSTGRES_DB:-postgres}
+    volumes:
+      - nuq-pg-data:/var/lib/postgresql/data
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - "pg_isready -U ${POSTGRES_USER:-postgres} -d ${POSTGRES_DB:-postgres}"
+      interval: 5s
+      timeout: 5s
+      retries: 6
+      start_period: 5s
+
+  # ---------- Pipeline (LangGraph CLI; run via `docker compose run`) ----------
+  app:
+    build: ./app
+    environment:
+      FIRECRAWL_API_URL: http://firecrawl-api:3002
+      OLLAMA_BASE_URL: http://ollama:11434
+      LLM_MODEL: ${LLM_MODEL:-qwen2.5:14b-instruct-q4_K_M}
+      EMBED_MODEL: ${EMBED_MODEL:-bge-large}
+      LLM_SEED: ${LLM_SEED:-1234}
+      MIN_WORDS: ${MIN_WORDS:-150}
+      DATA_DIR: /data
+      CHECKPOINT_DB: /checkpoints/corpus.db
+      MONGO_URI: mongodb://${MONGO_USER:-extractor}:${MONGO_PASSWORD:-extractor}@mongo:27017/?authSource=admin
+      MONGO_DB: ${MONGO_DB:-extractor}
+    ports:
+      # The only published port in the stack: the pipeline UI
+      - "${APP_PORT:-8080}:8000"
+    command: serve
+    volumes:
+      - ./data:/data
+      - ./checkpoints:/checkpoints
+    depends_on:
+      ollama-pull:
+        condition: service_completed_successfully
+      firecrawl-api:
+        condition: service_healthy
+      mongo:
+        condition: service_healthy
+
+volumes:
+  ollama-models:
+  nuq-pg-data:
+  mongo-data:
+
+# All services share one private bridge network. No host port is published
+# except firecrawl-api (the API entrypoint). NOT `internal: true` — firecrawl
+# and ollama-pull need outbound internet access.
+networks:
+  default:
+    name: extractor-internal
+    driver: bridge
