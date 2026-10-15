@@ -1,5 +1,24 @@
+# =============================================================================
+# extractor — deterministic website → RAG corpus pipeline
+#
+# Services:
+#   ollama               Local LLM + embeddings on GPU (no external calls)
+#   ollama-pull          One-shot container that pulls the pinned models
+#   firecrawl-api        Self-hosted Firecrawl REST API (map/scrape/crawl/extract)
+#   firecrawl-playwright Headless browser used by firecrawl for JS-heavy pages
+#   redis                Firecrawl job queue / rate limiting
+#   rabbitmq             Firecrawl job queue backend (NuQ)
+#   nuq-postgres         Firecrawl job metadata store (NuQ)
+#   mongo                Corpus store: docs, chunks, pages audit, run manifests
+#   app                  LangGraph pipeline + web UI/API (the only published port)
+#
+# All configuration comes from .env — there are intentionally NO ${VAR:-default}
+# fallbacks here, so a missing key fails fast instead of silently defaulting.
+# =============================================================================
 name: extractor
 
+# Shared environment for Firecrawl's internal services. Points its job queue at
+# redis/rabbitmq/nuq-postgres and its LLM features at the local Ollama instance.
 x-firecrawl-env: &firecrawl-env
   REDIS_URL: redis://redis:6379
   REDIS_RATE_LIMIT_URL: redis://redis:6379
@@ -9,6 +28,7 @@ x-firecrawl-env: &firecrawl-env
   POSTGRES_DB: ${POSTGRES_DB}
   POSTGRES_HOST: nuq-postgres
   POSTGRES_PORT: "5432"
+  # Self-hosted mode: no API key required for map/scrape/crawl/extract
   USE_DB_AUTHENTICATION: "false"
   NUM_WORKERS_PER_QUEUE: ${NUM_WORKERS_PER_QUEUE}
   CRAWL_CONCURRENT_REQUESTS: ${CRAWL_CONCURRENT_REQUESTS}
@@ -19,17 +39,21 @@ x-firecrawl-env: &firecrawl-env
   MODEL_EMBEDDING_NAME: ${EMBED_MODEL}
 
 services:
-  # ---------- Ollama (LLM + embeddings, GPU) ----------
+  # ---------------------------------------------------------------------------
+  # Ollama — serves LLM classification (qwen2.5:14b Q4_K_M) and embeddings
+  # (bge-large) on the host GPU. Internal only; app and firecrawl reach it at
+  # http://ollama:11434. Requires nvidia-container-toolkit on the host.
+  # ---------------------------------------------------------------------------
   ollama:
     image: ollama/ollama:latest
     container_name: extractor-ollama
     restart: unless-stopped
     volumes:
-      - ollama-models:/root/.ollama
+      - ollama-models:/root/.ollama   # model blobs persist across rebuilds
     environment:
-      OLLAMA_KEEP_ALIVE: 30m
-      OLLAMA_NUM_PARALLEL: "4"
-      OLLAMA_MAX_LOADED_MODELS: "2"
+      OLLAMA_KEEP_ALIVE: 30m          # keep models warm between classify calls
+      OLLAMA_NUM_PARALLEL: "4"        # concurrent classify requests from fan-out
+      OLLAMA_MAX_LOADED_MODELS: "2"   # qwen + bge-large stay resident
     deploy:
       resources:
         reservations:
@@ -38,13 +62,17 @@ services:
               count: all
               capabilities: [gpu]
     healthcheck:
-      test: ["CMD", "ollama", "ps"]
+      test: ["CMD", "ollama", "ps"]   # exits non-zero until API server is up
       interval: 10s
       timeout: 5s
       retries: 12
       start_period: 10s
 
-  # One-shot: pulls the pinned models, then exits. `app` waits on this.
+  # ---------------------------------------------------------------------------
+  # ollama-pull — one-shot init container: pulls the models pinned in .env,
+  # then exits. `app` depends on service_completed_successfully, so the pipeline
+  # can never run before models exist. Safe to re-run (skips existing models).
+  # ---------------------------------------------------------------------------
   ollama-pull:
     image: ollama/ollama:latest
     container_name: extractor-ollama-pull
@@ -59,13 +87,17 @@ services:
     entrypoint: /bin/sh
     command: -c 'ollama pull "$$LLM_MODEL" && ollama pull "$$EMBED_MODEL"'
 
-  # ---------- Firecrawl (self-hosted) ----------
+  # ---------------------------------------------------------------------------
+  # firecrawl-api — self-hosted Firecrawl REST API. Internal only (no host port)
+  # — the app calls /v1/map and /v1/scrape over the private network. The harness
+  # command also spawns the queue workers inside this container.
+  # ---------------------------------------------------------------------------
   firecrawl-api:
     image: ghcr.io/firecrawl/firecrawl:latest
     container_name: extractor-firecrawl-api
     restart: unless-stopped
     ulimits:
-      nofile:
+      nofile:                         # scraping opens many sockets
         soft: 65535
         hard: 65535
     environment:
@@ -87,6 +119,7 @@ services:
       nuq-postgres:
         condition: service_healthy
     healthcheck:
+      # Any HTTP response means the server is up (404 is fine)
       test:
         - CMD
         - node
@@ -95,15 +128,19 @@ services:
       interval: 10s
       timeout: 5s
       retries: 12
-      start_period: 30s
+      start_period: 30s               # harness needs time to boot workers
 
+  # ---------------------------------------------------------------------------
+  # firecrawl-playwright — headless Chromium used for JS-rendered pages.
+  # Hardened: drops all capabilities, no-new-privileges, tmpfs cache.
+  # ---------------------------------------------------------------------------
   firecrawl-playwright:
     image: ghcr.io/firecrawl/playwright-service:latest
     container_name: extractor-firecrawl-playwright
     restart: unless-stopped
     environment:
       PORT: "3000"
-      BLOCK_MEDIA: "true"
+      BLOCK_MEDIA: "true"             # skip images/fonts — faster, less bandwidth
       MAX_CONCURRENT_PAGES: ${CRAWL_CONCURRENT_REQUESTS}
     security_opt:
       - no-new-privileges:true
@@ -112,12 +149,18 @@ services:
     tmpfs:
       - /tmp/.cache:noexec,nosuid,size=1g
 
+  # ---------------------------------------------------------------------------
+  # redis — Firecrawl's job queue + rate-limit store. Internal only.
+  # ---------------------------------------------------------------------------
   redis:
     image: redis:alpine
     container_name: extractor-redis
     restart: unless-stopped
     command: redis-server --bind 0.0.0.0
 
+  # ---------------------------------------------------------------------------
+  # rabbitmq — Firecrawl NuQ message broker. Internal only.
+  # ---------------------------------------------------------------------------
   rabbitmq:
     image: rabbitmq:3-management
     container_name: extractor-rabbitmq
@@ -129,7 +172,10 @@ services:
       retries: 6
       start_period: 10s
 
-  # ---------- MongoDB (corpus store) ----------
+  # ---------------------------------------------------------------------------
+  # mongo — corpus store (extractor.docs / .chunks / .pages / .runs).
+  # Internal only: use `docker compose exec mongo mongosh ...` to query.
+  # ---------------------------------------------------------------------------
   mongo:
     image: mongo:7
     container_name: extractor-mongo
@@ -140,6 +186,7 @@ services:
     volumes:
       - mongo-data:/data/db
     healthcheck:
+      # NOTE: -u/-p flags, NOT a URI — quoted URIs keep $VARs from expanding
       test:
         - CMD-SHELL
         - >-
@@ -151,6 +198,9 @@ services:
       retries: 12
       start_period: 10s
 
+  # ---------------------------------------------------------------------------
+  # nuq-postgres — Firecrawl's NuQ job metadata store. Internal only.
+  # ---------------------------------------------------------------------------
   nuq-postgres:
     image: ghcr.io/firecrawl/nuq-postgres:latest
     container_name: extractor-nuq-postgres
@@ -170,13 +220,22 @@ services:
       retries: 6
       start_period: 5s
 
-  # ---------- Pipeline (LangGraph CLI; run via `docker compose run`) ----------
+  # ---------------------------------------------------------------------------
+  # app — LangGraph pipeline + FastAPI web UI.
+  #
+  #   * The ONLY service with a host-published port: ${APP_PORT} -> :8000
+  #   * `command: serve` runs the UI; CLI runs use `docker compose run app run <url>`
+  #   * Waits for: models pulled (ollama-pull exit 0), firecrawl healthy,
+  #     mongo healthy — so it can never start half-ready
+  #   * Volumes: corpus JSONL output -> ./data, LangGraph SQLite checkpoints
+  #     -> ./checkpoints (resume runs without re-scraping)
+  # ---------------------------------------------------------------------------
   app:
     build: ./app
     container_name: extractor-app
     environment:
-      FIRECRAWL_API_URL: http://firecrawl-api:3002
-      OLLAMA_BASE_URL: http://ollama:11434
+      FIRECRAWL_API_URL: http://firecrawl-api:3002   # internal service address
+      OLLAMA_BASE_URL: http://ollama:11434           # internal service address
       LLM_MODEL: ${LLM_MODEL}
       EMBED_MODEL: ${EMBED_MODEL}
       LLM_SEED: ${LLM_SEED}
@@ -201,13 +260,15 @@ services:
         condition: service_healthy
 
 volumes:
-  ollama-models:
-  nuq-pg-data:
-  mongo-data:
+  ollama-models:   # Ollama model blobs (~10 GB)
+  nuq-pg-data:     # Firecrawl job metadata
+  mongo-data:      # corpus: docs, chunks, pages, runs
 
-# All services share one private bridge network. No host port is published
-# except firecrawl-api (the API entrypoint). NOT `internal: true` — firecrawl
-# and ollama-pull need outbound internet access.
+# All services share one private bridge network. The ONLY host-published port
+# is ${APP_PORT} on `app` (the UI). NOT `internal: true` — firecrawl needs
+# outbound internet to scrape target sites and ollama-pull needs it to fetch
+# models. Everything else (ollama:11434, mongo:27017, redis, rabbitmq,
+# postgres, firecrawl-api:3002) is unreachable from the host.
 networks:
   default:
     name: extractor-internal

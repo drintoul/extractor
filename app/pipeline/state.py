@@ -15,12 +15,15 @@ class PageResult(TypedDict):
 class PageTask(TypedDict):
     """Payload sent to each process_page fan-out via Send()."""
     url: str
+    run_id: str  # needed for the cancellation check inside the node
 
 
 class CorpusState(TypedDict):
     seed_url: str
     run_id: str
+    started_at: str  # ISO timestamp, set once by the map node
     url_inventory: list[str]
+    catalog_skipped_urls: int  # product-catalog URLs excluded at discovery
     rejected_urls: dict[str, str]  # url -> rejection rule
     filtered_urls: list[str]
     # Keyed by URL so parallel fan-out results merge order-independently.

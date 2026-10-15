@@ -5,7 +5,8 @@ from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 NOISE_PATH = re.compile(
     r"/(tag|tags|author|authors|category|categories|page/\d+|feed|feeds|"
     r"comments|wp-json|wp-admin|cart|checkout|search|login|logout|register|"
-    r"account|share|print|amp|cdn-cgi|wp-includes)(/|$|\?)",
+    r"account|share|print|amp|cdn-cgi|wp-includes|wishlist|orderstatus)"
+    r"(/|$|\?|\.php$)",   # .php boundary catches BigCommerce-style cart.php etc.
     re.IGNORECASE,
 )
 NOISE_EXT = re.compile(
@@ -13,6 +14,10 @@ NOISE_EXT = re.compile(
     r"woff2?|ttf|eot|ics|csv|xlsx?|docx?|pptx?)$",
     re.IGNORECASE,
 )
+# Pure date listings — /2024 or /2024/05 (path ends at the date). Deliberately
+# does NOT match /2024/05/post-slug — real dated posts are content.
+DATE_PATH = re.compile(r"^/(?:19|20)\d{2}(/\d{2})?$")
+
 TRACKING_PARAMS = {"utm_source", "utm_medium", "utm_campaign", "utm_term",
                    "utm_content", "fbclid", "gclid", "ref", "replytocom", "share"}
 
@@ -28,8 +33,15 @@ def normalize_url(url: str) -> str | None:
     return urlunsplit((parts.scheme.lower(), parts.netloc.lower(), path, query, ""))
 
 
-def triage(urls: list[str]) -> tuple[list[str], dict[str, str]]:
-    """Returns (accepted sorted list, {url: reason} rejected map)."""
+def triage(urls: list[str],
+           extra_exclude: str = "") -> tuple[list[str], dict[str, str]]:
+    """Returns (accepted sorted list, {url: reason} rejected map).
+
+    extra_exclude: optional regex applied to the URL path — rejects e.g.
+    /products/|/product/ on platforms where product URLs have no other
+    discriminating signal.
+    """
+    user_ex = re.compile(extra_exclude, re.IGNORECASE) if extra_exclude else None
     seen: set[str] = set()
     accepted: list[str] = []
     rejected: dict[str, str] = {}
@@ -46,6 +58,10 @@ def triage(urls: list[str]) -> tuple[list[str], dict[str, str]]:
             rejected[url] = "binary-or-feed-extension"
         elif NOISE_PATH.search(path):
             rejected[url] = "noise-path"
+        elif DATE_PATH.match(path):
+            rejected[url] = "date-archive"
+        elif user_ex and user_ex.search(path):
+            rejected[url] = "user-excluded"
         else:
             accepted.append(url)
     return sorted(accepted), rejected

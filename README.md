@@ -1,8 +1,20 @@
 # extractor
 
-Deterministic website → RAG corpus pipeline. LangGraph-orchestrated,
-self-hosted Firecrawl for scraping, Ollama (GPU) for classification and
-embeddings.
+Deterministic website → RAG corpus pipeline. Give it a seed URL and it
+produces chunked, embedded, metadata-rich JSON documents — stored in MongoDB
+and as JSONL — ready to load into a vector store for a chatbot.
+
+Everything runs locally in Docker:
+
+- **Discovery + scraping** — self-hosted [Firecrawl](https://github.com/firecrawl/firecrawl)
+  (`/v1/map` for URL inventory, `/v1/scrape` with `onlyMainContent` per page)
+- **Classification + embeddings** — Ollama on your GPU: Qwen 2.5 14B (Q4_K_M)
+  judges keep/drop per page; BGE-large-en-v1.5 embeds chunks. No external API
+  calls, no keys.
+- **Orchestration** — LangGraph with SQLite checkpointing: deterministic
+  topology, resumable runs, content-hash IDs, idempotent Mongo upserts.
+- **Storage** — MongoDB holds docs, chunks (with embeddings), a per-URL audit
+  trail, and run manifests.
 
 ## Stack
 
@@ -14,12 +26,17 @@ embeddings.
 | `firecrawl-playwright` | `ghcr.io/firecrawl/playwright-service` | JS rendering |
 | `redis` / `rabbitmq` / `nuq-postgres` | official | Firecrawl queue backend |
 | `mongo` | `mongo:7` | corpus store (internal only) |
-| `app` | `./app` | LangGraph pipeline + web UI on :8080 |
+| `app` | `./app` | LangGraph pipeline + web UI on :8090 |
 
 ## Prerequisites
 
 - Docker + `nvidia-container-toolkit` (for the `deploy` GPU reservation on `ollama`)
-- ~24 GB VRAM free; ~12 GB disk for models
+- **NVIDIA GPU with 24 GB VRAM** — the defaults are sized for this:
+  Qwen 2.5 14B Q4_K_M (~9 GB) + bge-large (~0.7 GB) stay resident
+  (`OLLAMA_MAX_LOADED_MODELS=2`), leaving headroom for parallel classify
+  calls (`OLLAMA_NUM_PARALLEL=4`) and KV-cache context.
+  Smaller GPU? Lower `LLM_MODEL` in `.env` (e.g. `qwen2.5:7b-instruct-q4_K_M`).
+- ~12 GB disk for the models, plus a few GB for images
 
 ## Run
 
@@ -29,7 +46,7 @@ docker compose up -d          # starts infra, pulls models (slow first time)
 docker compose logs -f ollama-pull   # watch model pull progress
 ```
 
-Then open the UI at **http://localhost:8080** — paste a seed URL, hit Run,
+Then open the UI at **http://localhost:8090** — paste a seed URL, hit Run,
 and watch job status + per-page keep/drop results.
 
 CLI equivalent (same graph, same checkpoints):
@@ -38,17 +55,66 @@ CLI equivalent (same graph, same checkpoints):
 docker compose run --rm --service-ports=false app run https://docs.example.com
 ```
 
+## Configuration (.env)
+
+All settings live in `.env` (copy `.env.example`). docker-compose.yaml has no
+fallbacks — a missing key fails fast.
+
+| Variable | Purpose |
+|---|---|
+| `LLM_MODEL` | Ollama tag for keep/drop classification + Firecrawl `/extract` |
+| `EMBED_MODEL` | Ollama embedding tag (`bge-large` = bge-large-en-v1.5, 1024-dim) |
+| `LLM_SEED` | Fixed seed; combined with `temperature=0`/`top_k=1` for reproducible verdicts |
+| `POSTGRES_*` | Credentials for Firecrawl's internal `nuq-postgres` queue DB |
+| `NUM_WORKERS_PER_QUEUE` / `CRAWL_CONCURRENT_REQUESTS` / `MAX_CONCURRENT_JOBS` | Firecrawl worker concurrency |
+| `MONGO_USER` / `MONGO_PASSWORD` / `MONGO_DB` | Corpus store credentials + database name |
+| `APP_PORT` | Host port for the web UI/API — the only published port (default `8090`) |
+| `MIN_WORDS` | Word-count floor before a page reaches the LLM classifier |
+| `SITEMAP_SKIP_PATTERNS` | Substrings — child sitemaps matching one are skipped in sitemap-fallback discovery (drops whole product catalogs). Skipped sitemaps are still counted: if catalog URLs outnumber content pages, the run card flags `catalog_heavy` — a fit signal for RAG-chatbot prospecting |
+| `EXCLUDE_PATH_REGEX` | Optional regex rejected at triage as `user-excluded` (e.g. `/(products?)(/|$)` for Shopify/Woo-style paths) |
+
+## UI & API
+
+The `app` service exposes a web UI and JSON API on `APP_PORT`:
+
+| Endpoint | Purpose |
+|---|---|
+| `GET /` | Web UI — run form, job status, run history, page audit, chunk previews |
+| `POST /api/runs` | Start a run: `{"url": "https://…", "run_id": "optional"}` |
+| `GET /api/jobs` | In-flight run status + live stage progress (this process) |
+| `POST /api/jobs/{run_id}/kill` | Cooperative cancel — aborts at next node; partial work stays checkpointed |
+| `POST /api/runs/{run_id}/rerun` | Fresh execution as `<run_id>-rN` (new checkpoint, re-scrapes) |
+| `DELETE /api/runs/{run_id}` | Delete run: mongo rows, checkpoints, JSONL/manifest files |
+| `GET /api/runs` | Completed run manifests (from `extractor.runs`) |
+| `GET /api/pages?run_id=…&status=…` | Per-URL audit: status, reason, word count |
+| `GET /api/docs?run_id=…` | Kept documents for a run |
+| `GET /api/chunks?run_id=…[&doc_id=…]` | Chunk text/metadata (embeddings excluded) |
+
+Resubmitting an existing `run_id` resumes its checkpoint instead of restarting —
+that's also how a cancelled/failed job's **Resume** button works. **Kill** is
+cooperative: the graph aborts at the next node boundary, completed pages stay
+checkpointed, and resuming continues where it left off. **Re-run** on a
+finished run creates a fresh `-rN` checkpoint (full re-scrape).
+
 Output lands in `./data/` and MongoDB:
 
 - `corpus-<run_id>.jsonl` — one chunk per line: `chunk_id`, `doc_id`,
-  `source_url`, `title`, `section`, `text`, `embedding` (1024-dim, bge-large)
+  `source_url`, `title`, `section`, `text`, `embedding` (1024-dim, bge-large),
+  `archived`
 - `manifest-<run_id>.json` — counts, model pins, seed, status breakdown
-- `extractor.docs` — `{_id: doc_id, url, title, markdown, run_ids[]}`
+- `extractor.docs` — `{_id: doc_id, url, title, markdown, archived, run_ids[]}`
 - `extractor.chunks` — `{_id: chunk_id, doc_id, source_url, title, section,
-  text, embedding, run_id}`
+  text, embedding, archived, run_id}`
 - `extractor.pages` — per-URL audit: `{url, status, reason, word_count}`
   (query this to see why a page was dropped)
 - `extractor.runs` — `{_id: run_id, ...manifest}`
+
+`archived: true` is set on docs/chunks whose URL path contains `archive`
+(e.g. `/beer-archive/<product>`) — historical content that could read as
+currently available. Archived chunks also carry an in-text note
+(`[archived content — may no longer be current or available]`) so a RAG
+layer hedges availability claims even if it ignores the flag. Filter or
+qualify on `archived` in your retriever.
 
 All writes are upserts on content-hash IDs, so re-runs are idempotent.
 Mongo is internal-only — query it via the container:
@@ -58,7 +124,7 @@ Mongo is internal-only — query it via the container:
 
 All services share a single private bridge network (`extractor-internal`) with
 outbound internet access. The **only** host-published port is the app UI on
-`${APP_PORT:-8080}` → container `:8000`. Firecrawl, Ollama, Mongo, Redis,
+`${APP_PORT}` → container `:8000`. Firecrawl, Ollama, Mongo, Redis,
 RabbitMQ, and Postgres are unreachable from the host — all inter-container
 traffic (firecrawl-api:3002, ollama:11434, mongo:27017, …) stays on the
 internal network. Use `docker compose exec` for debugging access.
@@ -109,6 +175,19 @@ flowchart TD
   Ollama `/api/embed`
 - `persist`: idempotent upserts into `docs`, `chunks`, `pages`, `runs`
 
+### Page statuses
+
+Every processed URL lands in `extractor.pages` with one of:
+
+| Status | Meaning |
+|---|---|
+| `kept` | Passed all filters + LLM verdict; chunked and embedded |
+| `review` | LLM output failed to parse — kept for manual inspection |
+| `dropped_thin` | Under `MIN_WORDS` after denoising (stubs, nav pages) |
+| `dropped_llm` | Qwen judged it non-informational (reason is recorded) |
+| `scrape_error` | Firecrawl failed to fetch/render the page |
+| `rejected` | Never scraped — killed by a `triage.py` URL rule; `reason` says which |
+
 ## Using /extract
 
 Firecrawl's env points at Ollama (`OLLAMA_BASE_URL`, `MODEL_NAME`), so
@@ -116,6 +195,44 @@ Firecrawl's env points at Ollama (`OLLAMA_BASE_URL`, `MODEL_NAME`), so
 for structured
 entities — keep it out of the bulk corpus path; use it for schema'd records
 (FAQs, directories, product specs).
+
+## Migrating to a VPS
+
+Everything is containerized and self-contained — copy the repo (compose, `app/`,
+`.env`) plus the data you want to keep:
+
+```bash
+# Backup ollama models (~10 GB) and mongo corpus
+docker run --rm -v extractor_ollama-models:/v -v $(pwd):/backup alpine \
+  tar czf /backup/ollama-models.tar.gz -C /v .
+docker run --rm -v extractor_mongo-data:/v -v $(pwd):/backup alpine \
+  tar czf /backup/mongo-data.tar.gz -C /v .
+# scp *.tar.gz + repo to the VPS, restore into same-named volumes, then:
+docker compose up -d --build
+```
+
+- **No GPU on the VPS?** Remove the `deploy` block on `ollama` (CPU fallback) and
+  consider `LLM_MODEL=qwen2.5:7b` — 14B classification is very slow on CPU.
+- Skip the model archive if the VPS has good bandwidth — `ollama-pull`
+  re-downloads on first boot.
+- Checkpoints (`./checkpoints/corpus.db`) and output (`./data/`) are plain
+  files — copy them to preserve run history and resume capability.
+
+## Troubleshooting
+
+- **UI port conflict** — the host already runs many services; if `APP_PORT` is
+  taken the app container can start with no bound port (or a different server
+  answers). Pick a free port in `.env` and `docker compose up -d app`.
+- **`mongo` unhealthy** — the healthcheck must use `-u`/`-p` flags; putting
+  credentials in a single-quoted URI inside `test:` prevents `$VAR` expansion.
+- **First boot is slow** — `ollama-pull` downloads ~10 GB of models before
+  `app` starts (`service_completed_successfully`). Watch:
+  `docker compose logs -f ollama-pull`.
+- **Everything dropped** — check `extractor.pages`: `dropped_thin` → lower
+  `MIN_WORDS`; `dropped_llm` → the classify prompt in `nodes.py`
+  (`_CLASSIFY_SYSTEM`) may be too strict for business sites (menus, events).
+- **Resume a failed/interrupted run** — resubmit the same `run_id`; the
+  SQLite checkpoint replays completed nodes and only re-runs the rest.
 
 ## Notes
 

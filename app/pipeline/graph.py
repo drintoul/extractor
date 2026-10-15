@@ -39,3 +39,20 @@ def build_checkpointer() -> SqliteSaver:
     os.makedirs(os.path.dirname(SETTINGS.checkpoint_db) or ".", exist_ok=True)
     conn = sqlite3.connect(SETTINGS.checkpoint_db, check_same_thread=False)
     return SqliteSaver(conn)
+
+
+def delete_checkpoints(thread_id: str) -> int:
+    """Remove all checkpoint rows for a run — deletes resume capability."""
+    conn = sqlite3.connect(SETTINGS.checkpoint_db, check_same_thread=False)
+    deleted = 0
+    for table in ("checkpoints", "writes",
+                  "checkpoint_writes", "checkpoint_blobs"):
+        try:
+            deleted += conn.execute(
+                f"DELETE FROM {table} WHERE thread_id=?", (thread_id,)
+            ).rowcount
+        except sqlite3.OperationalError:
+            pass  # table name differs across langgraph-checkpoint versions
+    conn.commit()
+    conn.close()
+    return deleted

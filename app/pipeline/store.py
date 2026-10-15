@@ -27,14 +27,17 @@ def save_run(state: dict, corpus_path: str) -> dict:
         UpdateOne(
             {"_id": d["doc_id"]},
             {"$setOnInsert": {"url": d["url"], "title": d["title"],
-                              "markdown": d["markdown"]},
+                              "markdown": d["markdown"],
+                              "archived": d["archived"]},
              "$addToSet": {"run_ids": run_id}},
             upsert=True,
         )
         for d in state["docs"]
     ]) if state["docs"] else None
 
-    db.pages.bulk_write([
+    # Scraped pages + URLs rejected at triage (so the audit answers
+    # "filtered — but why?" for every discovered URL)
+    page_ops = [
         UpdateOne(
             {"_id": f"{run_id}:{hashlib.sha256(url.encode()).hexdigest()[:16]}"},
             {"$set": {"url": url, "run_id": run_id, "status": p["status"],
@@ -43,7 +46,17 @@ def save_run(state: dict, corpus_path: str) -> dict:
             upsert=True,
         )
         for url, p in state["pages"].items()
-    ]) if state["pages"] else None
+    ] + [
+        UpdateOne(
+            {"_id": f"{run_id}:{hashlib.sha256(url.encode()).hexdigest()[:16]}"},
+            {"$set": {"url": url, "run_id": run_id, "status": "rejected",
+                      "reason": rule, "word_count": 0, "doc_id": None}},
+            upsert=True,
+        )
+        for url, rule in state.get("rejected_urls", {}).items()
+    ]
+    if page_ops:
+        db.pages.bulk_write(page_ops)
 
     chunks = []
     with open(corpus_path) as f:
@@ -54,6 +67,7 @@ def save_run(state: dict, corpus_path: str) -> dict:
                 {"$set": {"doc_id": c["doc_id"], "source_url": c["source_url"],
                           "title": c["title"], "section": c["section"],
                           "text": c["text"], "embedding": c["embedding"],
+                          "archived": c.get("archived", False),
                           "run_id": run_id}},
                 upsert=True,
             ))

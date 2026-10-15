@@ -12,6 +12,14 @@ class Settings:
     min_words: int = int(os.environ.get("MIN_WORDS", "150"))
     scrape_timeout_ms: int = int(os.environ.get("SCRAPE_TIMEOUT_MS", "30000"))
     map_limit: int = int(os.environ.get("MAP_LIMIT", "5000"))
+    # comma-separated substrings: child sitemaps whose URL contains one are
+    # skipped entirely (BigCommerce ?type=products, *-product-sitemap.xml, …)
+    sitemap_skip_patterns: str = os.environ.get(
+        "SITEMAP_SKIP_PATTERNS",
+        "type=products,product-sitemap,products-sitemap")
+    # optional regex applied to every discovered URL path during triage —
+    # rejects e.g. /products/ or /product/ on platforms with no type signal
+    exclude_path_regex: str = os.environ.get("EXCLUDE_PATH_REGEX", "")
     data_dir: str = os.environ.get("DATA_DIR", "./data")
     checkpoint_db: str = os.environ.get("CHECKPOINT_DB", "./checkpoints/corpus.db")
     mongo_uri: str = os.environ.get("MONGO_URI", "mongodb://localhost:27017")
@@ -26,6 +34,7 @@ class Settings:
             "seed": self.llm_seed,
             "top_k": 1,
             "num_ctx": 8192,
+            "num_predict": 200,   # verdict is ~20 tokens; caps runaway generation
         })
 
 
