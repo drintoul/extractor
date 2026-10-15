@@ -5,7 +5,9 @@ import json
 import os
 import pickle
 import re
+import sqlite3
 import threading
+import time
 from datetime import datetime, timezone
 from urllib.parse import urlsplit
 
@@ -95,14 +97,15 @@ def start_run(req: RunRequest):
 
 @app.post("/api/runs/{run_id}/rerun")
 def rerun(run_id: str):
-    """Fresh execution of a completed run — new run_id <base>-rN."""
+    """Fresh execution of a completed run — new run_id with a distinct hash."""
+    import hashlib
     doc = get_db().runs.find_one({"_id": run_id})
     if not doc:
         raise HTTPException(404, "run not found")
-    base = re.sub(r"-r\d+$", "", run_id)
-    n = 1 + get_db().runs.count_documents(
-        {"_id": {"$regex": f"^{re.escape(base)}-r\\d+$"}})
-    new_id = f"{base}-r{n}"
+    host = urlsplit(doc["seed_url"]).netloc.replace(".", "-")
+    host = re.sub(r"^www-", "", host)
+    salt = doc["seed_url"] + datetime.now(timezone.utc).isoformat()
+    new_id = f"{host}-{hashlib.sha256(salt.encode()).hexdigest()[:8]}"
     _start(doc["seed_url"], new_id)
     return {"run_id": new_id, "status": "started"}
 
@@ -159,8 +162,29 @@ def _progress(values: dict) -> dict:
     return {"stage": stage, "processed": processed, "total": total}
 
 
+def _writes_count(run_id: str) -> int | None:
+    """Completed task writes in the LangGraph checkpoint — grows in real time
+    during the fan-out, unlike `pages` which only appears on commit."""
+    try:
+        conn = sqlite3.connect(SETTINGS.checkpoint_db)
+        for table in ("writes", "checkpoint_writes"):
+            try:
+                n = conn.execute(
+                    f"SELECT COUNT(*) FROM {table} WHERE thread_id=?",
+                    (run_id,)).fetchone()[0]
+                conn.close()
+                return n
+            except sqlite3.OperationalError:
+                continue
+        conn.close()
+    except Exception:
+        pass
+    return None
+
+
 @app.get("/api/jobs")
 def jobs():
+    now = time.time()
     out = {}
     for run_id, job in _jobs.items():
         if job["status"] == "done":
@@ -173,6 +197,14 @@ def jobs():
                 entry["progress"] = _progress(values)
             except Exception:
                 pass
+            w = _writes_count(run_id)
+            if w is not None:
+                if w != job.get("_w"):
+                    job["_w"], job["_wt"] = w, now
+                entry["writes"] = w
+            entry["idle_s"] = int(now - job.get("_wt", now))
+        for k in ("_w", "_wt"):
+            entry.pop(k, None)
         out[run_id] = entry
     return out
 
@@ -359,12 +391,16 @@ _PAGE = """<!doctype html>
   td.u a:hover{color:#2d5;text-decoration:underline}
   .run{cursor:pointer;padding:.4rem;border:1px solid #333;margin:.3rem 0}
   .run:hover{background:#1c1c1c}
+  .run.sel{border-color:#2d5;background:#17251c}
   .kept{color:#4d7}.dropped,.dropped_llm,.dropped_thin{color:#d66}
   .rejected,.removed{color:#888}
   .flag{color:#fc4}
   .error{color:#d66}.running{color:#fd4}.review,.scrape_error{color:#fa0}
   .cancelled{color:#c9a227}
   .empty{color:#fa0;font-style:italic}
+  .pulse{color:#2d5;animation:pl 1.2s infinite}
+  @keyframes pl{50%{opacity:.15}}
+  .stalled{color:#fa0}
   button.kill{background:#c44}
   button.small{padding:.2rem .6rem;font-size:.8rem}
   a.btn{display:inline-block;padding:.2rem .6rem;font-size:.8rem;
@@ -474,6 +510,11 @@ async function refresh() {
     (v.url ? `<br><small>${esc(v.url)}</small>` : '') +
     (v.started_at ? ` — started ${fmtTime(v.started_at)}` : '') +
     (v.progress ? ` — ${esc(v.progress.stage)}` : '') +
+    (v.status === 'running'
+      ? (v.idle_s != null && v.idle_s >= 20
+          ? ` <span class="stalled">◌ no progress for ${fmtDur(v.idle_s)}</span>`
+          : ' <span class="pulse">●</span>') : '') +
+    (v.writes != null ? ` <small>(${v.writes} tasks done)</small>` : '') +
     (v.error ? ` — ${esc(v.error)}` : '') +
     (v.status === 'running'
       ? ` <button class="kill small" onclick="killJob('${k}')">Kill</button>` : '') +
@@ -500,7 +541,7 @@ async function refresh() {
     const empty = (c.docs||0) === 0
       ? `<br><span class="empty">Nothing kept — corpus is empty. ` +
         `Click to see why each URL was dropped.</span>` : '';
-    return `<div class="run" onclick="detail('${r.run_id}')">` +
+    return `<div class="run${r.run_id===_sel?' sel':''}" onclick="detail('${r.run_id}')">` +
       `<b>${r.run_id}</b> ` +
       `<button class="small" onclick="event.stopPropagation();rerunRun('${r.run_id}')">Re-run</button> ` +
       `<a class="small btn" href="/api/runs/${r.run_id}/export.pkl" onclick="event.stopPropagation()">pkl</a> ` +
@@ -525,7 +566,9 @@ async function removePage(runId, btn) {
   detail(runId); refresh();
 }
 
+let _sel = null;
 async function detail(runId) {
+  _sel = runId; refresh();
   const ps = await (await fetch(`/api/pages?run_id=${runId}`)).json();
   const cs = await (await fetch(`/api/chunks?run_id=${runId}`)).json();
   ps.sort((a,b) => (STATUS_RANK[a.status]??9)-(STATUS_RANK[b.status]??9)

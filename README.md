@@ -83,7 +83,7 @@ The `app` service exposes a web UI and JSON API on `APP_PORT`:
 | `POST /api/runs` | Start a run: `{"url": "https://…", "run_id": "optional"}` |
 | `GET /api/jobs` | In-flight run status + live stage progress (this process) |
 | `POST /api/jobs/{run_id}/kill` | Cooperative cancel — aborts at next node; partial work stays checkpointed |
-| `POST /api/runs/{run_id}/rerun` | Fresh execution as `<run_id>-rN` (new checkpoint, re-scrapes) |
+| `POST /api/runs/{run_id}/rerun` | Fresh execution under a new hash-suffixed run_id (re-scrapes) |
 | `DELETE /api/runs/{run_id}` | Delete run: mongo rows, checkpoints, JSONL/manifest files |
 | `GET /api/runs` | Completed run manifests (from `extractor.runs`) |
 | `GET /api/pages?run_id=…&status=…` | Per-URL audit: status, reason, word count |
@@ -97,7 +97,8 @@ Resubmitting an existing `run_id` resumes its checkpoint instead of restarting �
 that's also how a cancelled/failed job's **Resume** button works. **Kill** is
 cooperative: the graph aborts at the next node boundary, completed pages stay
 checkpointed, and resuming continues where it left off. **Re-run** on a
-finished run creates a fresh `-rN` checkpoint (full re-scrape).
+finished run creates a fresh checkpoint under a new hash-suffixed run_id
+(full re-scrape).
 
 Output lands in `./data/` and MongoDB:
 
