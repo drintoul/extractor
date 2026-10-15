@@ -78,7 +78,7 @@ internal network. Use `docker compose exec` for debugging access.
 ## Pipeline
 
 ```mermaid
-flowchart LR
+flowchart TD
     S([START]) --> map["map<br/>Firecrawl /v1/map"]
     map --> triage["triage<br/>regex URL filter + normalize"]
     triage -- "Send × N (parallel, checkpointed per page)" --> pp
