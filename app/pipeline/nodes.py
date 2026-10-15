@@ -170,6 +170,13 @@ def chunk_embed_node(state: CorpusState) -> dict:
         "llm_model": SETTINGS.llm_model,
         "embed_model": SETTINGS.embed_model,
         "llm_seed": SETTINGS.llm_seed,
+        "settings": {
+            "min_words": SETTINGS.min_words,
+            "map_limit": SETTINGS.map_limit,
+            "scrape_timeout_ms": SETTINGS.scrape_timeout_ms,
+            "sitemap_skip_patterns": SETTINGS.sitemap_skip_patterns,
+            "exclude_path_regex": SETTINGS.exclude_path_regex,
+        },
         "counts": {
             "urls_mapped": len(state["url_inventory"]),
             "urls_rejected": len(state["rejected_urls"]),
@@ -194,4 +201,6 @@ def persist_node(state: CorpusState) -> dict:
         raise cancel.Cancelled()
     store.ensure_indexes()
     store.save_run(state, state["manifest"]["outputs"]["corpus"])
+    # re-apply the user's curated keep/remove selections for this site
+    store.apply_overrides(state)
     return {}

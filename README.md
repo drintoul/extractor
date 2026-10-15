@@ -89,6 +89,9 @@ The `app` service exposes a web UI and JSON API on `APP_PORT`:
 | `GET /api/pages?run_id=…&status=…` | Per-URL audit: status, reason, word count |
 | `GET /api/docs?run_id=…` | Kept documents for a run |
 | `GET /api/chunks?run_id=…[&doc_id=…]` | Chunk text/metadata (embeddings excluded) |
+| `POST /api/runs/{run_id}/keep?url=…` | Manual keep: chunks+embeds the page into the corpus |
+| `POST /api/runs/{run_id}/remove?url=…` | Manual remove: pulls the page's chunks out of the corpus |
+| `GET /api/runs/{run_id}/export.pkl` / `.jsonl` | Self-describing corpus export (metadata + chunks) |
 
 Resubmitting an existing `run_id` resumes its checkpoint instead of restarting —
 that's also how a cancelled/failed job's **Resume** button works. **Kill** is
@@ -101,13 +104,34 @@ Output lands in `./data/` and MongoDB:
 - `corpus-<run_id>.jsonl` — one chunk per line: `chunk_id`, `doc_id`,
   `source_url`, `title`, `section`, `text`, `embedding` (1024-dim, bge-large),
   `archived`
-- `manifest-<run_id>.json` — counts, model pins, seed, status breakdown
+- `manifest-<run_id>.json` — counts, model pins, seed, status breakdown,
+  `settings` snapshot (`min_words`, `map_limit`, `scrape_timeout_ms`,
+  `sitemap_skip_patterns`, `exclude_path_regex`)
 - `extractor.docs` — `{_id: doc_id, url, title, markdown, archived, run_ids[]}`
 - `extractor.chunks` — `{_id: chunk_id, doc_id, source_url, title, section,
   text, embedding, archived, run_id}`
 - `extractor.pages` — per-URL audit: `{url, status, reason, word_count}`
   (query this to see why a page was dropped)
 - `extractor.runs` — `{_id: run_id, ...manifest}`
+- `extractor.overrides` — manual curation: `{seed_url, url, action, run_id,
+  at}` — keep/remove selections recorded per site and re-applied at persist
+  time on re-runs (the classifier verdict never overrides your judgment)
+
+**Exports** (`pkl`/`jsonl` links on each run card, or
+`GET /api/runs/<id>/export.pkl|jsonl`) are self-describing:
+
+```python
+corpus = pickle.load(open("corpus-<run>.pkl", "rb"))
+# corpus = {"run_id", "seed_url", "models": {llm, embed},
+#           "settings": {min_words, ...}, "counts": {...},
+#           "overrides": [{url, action, at}], "chunks": [...]}
+for c in corpus["chunks"]:  # chunk_id, doc_id, source_url, title,
+    ...                     # section, text, embedding (1024-dim), archived
+```
+
+The JSONL export is the same shape as a header line: first line is
+`{"_meta": {run_id, seed_url, models, settings, counts, overrides}}`,
+remaining lines are chunks — skip `line["_meta"]` when streaming.
 
 `archived: true` is set on docs/chunks whose URL path contains `archive`
 (e.g. `/beer-archive/<product>`) — historical content that could read as

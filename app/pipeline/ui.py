@@ -15,7 +15,7 @@ from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import HTMLResponse, Response
 from pydantic import BaseModel
 
-from . import cancel
+from . import cancel, store
 from .config import SETTINGS
 from .graph import build_checkpointer, build_graph, delete_checkpoints
 from .store import get_db
@@ -198,62 +198,14 @@ def keep_page(run_id: str, url: str = Query(...)):
     if len(md.split()) < 3:
         raise HTTPException(400, "no scraped content to keep")
 
-    import hashlib
-    from . import chunking, clients
-
-    doc_id = hashlib.sha256(md.encode()).hexdigest()
-    archived = "archive" in urlsplit(url).path.lower()
-    db = get_db()
-    new_doc = db.docs.find_one({"_id": doc_id, "run_ids": run_id}) is None
-    db.docs.update_one(
-        {"_id": doc_id},
-        {"$setOnInsert": {"url": url, "title": page.get("title"),
-                          "markdown": md, "archived": archived},
-         "$addToSet": {"run_ids": run_id}},
-        upsert=True)
-
-    chunks = []
-    for c in chunking.chunk_document(doc_id, url, page.get("title") or "", md):
-        c["archived"] = archived
-        if archived:
-            c["text"] = ("[archived content — may no longer be current or "
-                         "available]\n\n") + c["text"]
-        chunks.append(c)
-    for i in range(0, len(chunks), 32):
-        batch = chunks[i:i + 32]
-        for c, vec in zip(batch, clients.embed([c["text"] for c in batch])):
-            c["embedding"] = vec
-    from pymongo import UpdateOne
-    res = db.chunks.bulk_write([
-        UpdateOne({"_id": c["chunk_id"]},
-                  {"$set": {**{k: c[k] for k in
-                               ("doc_id", "source_url", "title", "section",
-                                "text", "embedding", "archived")},
-                            "run_id": run_id}},
-                  upsert=True)
-        for c in chunks])
-
-    # keep the JSONL artifact in sync with the corpus
     corpus_path = os.path.join(SETTINGS.data_dir, f"corpus-{run_id}.jsonl")
-    if os.path.exists(corpus_path):
-        with open(corpus_path, "a") as f:
-            for c in chunks:
-                f.write(json.dumps(c, ensure_ascii=False) + "\n")
-
-    old_status = page["status"]
-    pid = f"{run_id}:{hashlib.sha256(url.encode()).hexdigest()[:16]}"
-    db.pages.update_one(
-        {"_id": pid},
-        {"$set": {"status": "kept", "doc_id": doc_id,
-                  "reason": f"manually kept — was {old_status}"}})
-
-    inc = {f"counts.pages_by_status.{old_status}": -1,
-           "counts.pages_by_status.kept": 1,
-           "counts.chunks": res.upserted_count}
-    if new_doc:
-        inc["counts.docs"] = 1
-    db.runs.update_one({"_id": run_id}, {"$inc": inc})
-    return {"status": "kept", "doc_id": doc_id, "chunks": len(chunks)}
+    inc = store.apply_keep(run_id, url, page.get("title"), md,
+                           page["status"], corpus_path)
+    get_db().runs.update_one({"_id": run_id}, {"$inc": inc})
+    seed = values.get("seed_url")
+    if seed:
+        store.record_override(seed, run_id, url, "keep")
+    return {"status": "kept", **inc}
 
 
 @app.post("/api/runs/{run_id}/remove")
@@ -268,66 +220,48 @@ def remove_page(run_id: str, url: str = Query(...)):
     page = db.pages.find_one({"_id": pid})
     if not page or page["status"] != "kept" or not page.get("doc_id"):
         raise HTTPException(400, "only kept pages can be removed")
-    doc_id = page["doc_id"]
 
-    doc = db.docs.find_one({"_id": doc_id})
-    n_chunks = doc_removed = 0
-    # only touch doc/chunks if this page is the doc's canonical source —
-    # a dedupe loser shares doc_id with the surviving sibling's chunks
-    if doc and doc.get("url") == url:
-        shared = any(r != run_id for r in doc.get("run_ids", []))
-        doomed = [c["_id"] for c in db.chunks.find(
-            {"doc_id": doc_id} | ({"run_id": run_id} if shared else {}),
-            {"_id": 1})]
-        # shared doc survives -> drop only this run's chunks; orphan -> all
-        n_chunks = db.chunks.delete_many({"_id": {"$in": doomed}}).deleted_count
-        if shared:
-            db.docs.update_one({"_id": doc_id},
-                               {"$pull": {"run_ids": run_id}})
-        else:
-            db.docs.delete_one({"_id": doc_id})
-        doc_removed = 1
-        corpus_path = os.path.join(SETTINGS.data_dir, f"corpus-{run_id}.jsonl")
-        if doomed and os.path.exists(corpus_path):
-            with open(corpus_path) as f:
-                lines = [l for l in f
-                         if json.loads(l)["chunk_id"] not in doomed]
-            with open(corpus_path, "w") as f:
-                f.writelines(lines)
-
-    db.pages.update_one(
-        {"_id": pid},
-        {"$set": {"status": "removed", "doc_id": None,
-                  "reason": "manually removed — was kept"}})
-    db.runs.update_one({"_id": run_id}, {"$inc": {
-        "counts.pages_by_status.kept": -1,
-        "counts.pages_by_status.removed": 1,
-        "counts.chunks": -n_chunks,
-        "counts.docs": -doc_removed}})
-    return {"status": "removed", "chunks_deleted": n_chunks}
+    corpus_path = os.path.join(SETTINGS.data_dir, f"corpus-{run_id}.jsonl")
+    inc = store.apply_remove(run_id, url, page["doc_id"], "kept", corpus_path)
+    db.runs.update_one({"_id": run_id}, {"$inc": inc})
+    run = db.runs.find_one({"_id": run_id}, {"seed_url": 1})
+    if run and run.get("seed_url"):
+        store.record_override(run["seed_url"], run_id, url, "remove")
+    return {"status": "removed", **inc}
 
 
-def _corpus_rows(run_id: str) -> list[dict]:
-    """Chunks for every doc attributed to the run. Joined via doc_ids, not
-    chunk.run_id — that field is overwritten when a later run re-writes a
-    shared doc's chunks."""
+def _corpus_payload(run_id: str) -> dict:
+    """Self-describing corpus export: run metadata (incl. extraction settings),
+    the user's manual keep/remove selections, and every chunk attributed to
+    the run — joined via docs.run_ids (chunk.run_id is overwritten when a
+    later run re-writes a shared doc's chunks)."""
     db = get_db()
+    run = db.runs.find_one({"_id": run_id}, {"_id": 0}) or {}
     doc_ids = [d["_id"] for d in db.docs.find({"run_ids": run_id}, {"_id": 1})]
-    return [{"chunk_id": c["_id"], "doc_id": c["doc_id"],
-             "source_url": c["source_url"], "title": c.get("title"),
-             "section": c.get("section"), "text": c["text"],
-             "embedding": c.get("embedding"),
-             "archived": c.get("archived", False)}
-            for c in db.chunks.find({"doc_id": {"$in": doc_ids}})]
+    chunks = [{"chunk_id": c["_id"], "doc_id": c["doc_id"],
+               "source_url": c["source_url"], "title": c.get("title"),
+               "section": c.get("section"), "text": c["text"],
+               "embedding": c.get("embedding"),
+               "archived": c.get("archived", False)}
+              for c in db.chunks.find({"doc_id": {"$in": doc_ids}})]
+    overrides = [{"url": o["url"], "action": o["action"], "at": o.get("at")}
+                 for o in db.overrides.find({"run_id": run_id}, {"_id": 0})]
+    return {"run_id": run_id, "seed_url": run.get("seed_url"),
+            "models": {"llm": run.get("llm_model"),
+                       "embed": run.get("embed_model")},
+            "settings": run.get("settings", {}),
+            "counts": run.get("counts", {}),
+            "overrides": overrides, "chunks": chunks}
 
 
 @app.get("/api/runs/{run_id}/export.pkl")
 def export_pkl(run_id: str):
-    """Corpus as a pickled list[dict] — one dict per chunk with text,
-    1024-dim bge embedding, and citation metadata. Load with:
-        rows = pickle.load(open('corpus-<run>.pkl','rb'))"""
+    """Corpus as a pickled dict — {run_id, seed_url, models, settings,
+    counts, overrides, chunks}. Load with:
+        corpus = pickle.load(open('corpus-<run>.pkl','rb'))
+        chunks = corpus["chunks"]"""
     return Response(
-        pickle.dumps(_corpus_rows(run_id), protocol=5),
+        pickle.dumps(_corpus_payload(run_id), protocol=5),
         media_type="application/octet-stream",
         headers={"Content-Disposition":
                  f'attachment; filename="corpus-{run_id}.pkl"'})
@@ -335,9 +269,13 @@ def export_pkl(run_id: str):
 
 @app.get("/api/runs/{run_id}/export.jsonl")
 def export_jsonl(run_id: str):
-    """Same corpus as JSONL — one chunk per line."""
-    payload = "".join(json.dumps(r, ensure_ascii=False) + "\n"
-                      for r in _corpus_rows(run_id))
+    """Same corpus as JSONL — first line is metadata (_meta), rest are chunks."""
+    p = _corpus_payload(run_id)
+    meta = {k: p[k] for k in ("run_id", "seed_url", "models", "settings",
+                              "counts", "overrides")}
+    payload = (json.dumps({"_meta": meta}, ensure_ascii=False) + "\n" +
+               "".join(json.dumps(r, ensure_ascii=False) + "\n"
+                       for r in p["chunks"]))
     return Response(
         payload, media_type="application/jsonl",
         headers={"Content-Disposition":
@@ -439,6 +377,11 @@ _PAGE = """<!doctype html>
   details summary{cursor:pointer;font-weight:700;font-size:1.1rem;
       padding:.3rem 0;user-select:none}
   details summary:hover{color:#2d5}
+  .chunk{padding:.7rem .9rem;font-size:.8rem;white-space:pre-wrap;
+      word-break:break-word;background:#1c1c1c;
+      border:1px solid #2a2a2a;margin:.3rem 0;border-radius:3px}
+  .chunk:nth-of-type(even){background:#242424}
+  .chunk .meta{color:#7ab;display:block;margin-bottom:.4rem;font-size:.75rem}
 </style></head><body>
 <h1>extractor</h1>
 <form id="f"><input id="url" placeholder="https://docs.example.com" required>
@@ -597,10 +540,10 @@ async function detail(runId) {
         ? `<button class="small kill" onclick="removePage('${runId}',this)">remove</button>`
         : `<button class="small" onclick="keepPage('${runId}',this)">keep</button>`}</td>
       </tr>`).join('') + `</table></details>
-    <details><summary>Sample chunks (${Math.min(5, cs.length)} of ${cs.length})</summary><pre>` +
+    <details><summary>Sample chunks (${Math.min(5, cs.length)} of ${cs.length})</summary>` +
     (cs.slice(0,5).map(c =>
-      `# ${esc(c.source_url)}\\n## ${esc(c.section||'(root)')}\\n\\n${esc(c.text.slice(0,600))}…`
-    ).join('\\n\\n---\\n\\n') || '(no chunks)') + '</pre></details>';
+      `<div class="chunk"><span class="meta">${esc(c.source_url)} — ${esc(c.section||'(root)')}</span>${esc(c.text.slice(0,600))}…</div>`
+    ).join('') || '(no chunks)') + '</details>';
 }
 refresh(); setInterval(refresh, 4000);
 </script></body></html>"""
