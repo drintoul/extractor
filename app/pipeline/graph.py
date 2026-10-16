@@ -1,6 +1,12 @@
 """Deterministic LangGraph assembly.
 
-START → map → triage ──[Send per URL]──→ process_page → dedupe → chunk_embed → persist → END
+START → map → triage → dispatch ──[Send batch]──→ process_page ─┐
+                    ↑______________ (next batch) ______________┘
+                    └── (urls exhausted) ─→ dedupe → chunk_embed → persist → END
+
+The fan-out is batched (BATCH_SIZE per superstep): kills are honored at the
+dispatch boundary, and each batch commits a checkpoint so progress is live
+and resumes replay at batch granularity.
 
 Conditional edges are pure functions of state — the LLM never decides routing.
 Checkpointing makes every node output replayable and per-page retries free.
@@ -19,6 +25,7 @@ def build_graph(checkpointer=None):
     builder = StateGraph(CorpusState)
     builder.add_node("map", nodes.map_node)
     builder.add_node("triage", nodes.triage_node)
+    builder.add_node("dispatch", nodes.dispatch_node)
     builder.add_node("process_page", nodes.process_page_node)
     builder.add_node("dedupe", nodes.dedupe_node)
     builder.add_node("chunk_embed", nodes.chunk_embed_node)
@@ -26,8 +33,10 @@ def build_graph(checkpointer=None):
 
     builder.add_edge(START, "map")
     builder.add_edge("map", "triage")
-    builder.add_conditional_edges("triage", nodes.fan_out, ["process_page", "dedupe"])
-    builder.add_edge("process_page", "dedupe")
+    builder.add_edge("triage", "dispatch")
+    builder.add_conditional_edges("dispatch", nodes.fan_out,
+                                  ["process_page", "dedupe"])
+    builder.add_edge("process_page", "dispatch")  # next batch
     builder.add_edge("dedupe", "chunk_embed")
     builder.add_edge("chunk_embed", "persist")
     builder.add_edge("persist", END)

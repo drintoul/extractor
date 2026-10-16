@@ -172,8 +172,10 @@ internal network. Use `docker compose exec` for debugging access.
 flowchart TD
     S([START]) --> map["map<br/>Firecrawl /v1/map"]
     map --> triage["triage<br/>regex URL filter + normalize"]
-    triage -- "Send × N (parallel, checkpointed per page)" --> pp
-    triage -- "no URLs" --> dedupe
+    triage --> dispatch["dispatch<br/>advance batch cursor"]
+    dispatch -- "Send × ≤BATCH_SIZE<br/>(default 200)" --> pp
+    pp --> dispatch
+    dispatch -- "all batches done" --> dedupe
 
     subgraph pp["process_page — one instance per URL"]
         scrape["/v1/scrape<br/>onlyMainContent"] --> clean["rule-based denoise"]

@@ -116,13 +116,14 @@ def kill(run_id: str):
     if not job or job["status"] != "running":
         raise HTTPException(400, "job is not running")
     cancel.request(run_id)
+    job["status"] = "cancelling"  # fan-out may take a while to unwind
     return {"run_id": run_id, "status": "cancelling"}
 
 
 @app.delete("/api/runs/{run_id}")
 def delete_run(run_id: str):
     """Remove a run's full footprint: mongo rows, checkpoint, artifacts."""
-    if _jobs.get(run_id, {}).get("status") == "running":
+    if _jobs.get(run_id, {}).get("status") in ("running", "cancelling"):
         raise HTTPException(409, "job is running — kill it first")
     db = get_db()
     removed = {
@@ -190,7 +191,7 @@ def jobs():
         if job["status"] == "done":
             continue  # completed runs live in Runs, not Jobs
         entry = dict(job)
-        if job["status"] == "running":
+        if job["status"] in ("running", "cancelling"):
             try:
                 values = _get_graph().get_state(
                     {"configurable": {"thread_id": run_id}}).values
@@ -213,7 +214,7 @@ def jobs():
 def keep_page(run_id: str, url: str = Query(...)):
     """Manually mark a dropped page as kept: pulls its markdown from the
     LangGraph checkpoint, chunks + embeds + persists it into the corpus."""
-    if _jobs.get(run_id, {}).get("status") == "running":
+    if _jobs.get(run_id, {}).get("status") in ("running", "cancelling"):
         raise HTTPException(409, "run in progress — wait or kill first")
     try:
         values = _get_graph().get_state(
@@ -244,7 +245,7 @@ def keep_page(run_id: str, url: str = Query(...)):
 def remove_page(run_id: str, url: str = Query(...)):
     """Manually remove a kept page: drops its doc/chunks from the corpus,
     keeping shared docs that other runs still reference."""
-    if _jobs.get(run_id, {}).get("status") == "running":
+    if _jobs.get(run_id, {}).get("status") in ("running", "cancelling"):
         raise HTTPException(409, "run in progress — wait or kill first")
     import hashlib
     db = get_db()
@@ -395,7 +396,7 @@ _PAGE = """<!doctype html>
   .kept{color:#4d7}.dropped,.dropped_llm,.dropped_thin{color:#d66}
   .rejected,.removed{color:#888}
   .flag{color:#fc4}
-  .error{color:#d66}.running{color:#fd4}.review,.scrape_error{color:#fa0}
+  .error{color:#d66}.running,.cancelling{color:#fd4}.review,.scrape_error{color:#fa0}
   .cancelled{color:#c9a227}
   .empty{color:#fa0;font-style:italic}
   .pulse{color:#2d5;animation:pl 1.2s infinite}
@@ -510,8 +511,10 @@ async function refresh() {
     (v.url ? `<br><small>${esc(v.url)}</small>` : '') +
     (v.started_at ? ` — started ${fmtTime(v.started_at)}` : '') +
     (v.progress ? ` — ${esc(v.progress.stage)}` : '') +
-    (v.status === 'running'
-      ? (v.idle_s != null && v.idle_s >= 20
+    (v.status === 'cancelling'
+      ? ' <span class="stalled">◌ cancelling…</span>'
+      : v.status === 'running'
+      ? (v.idle_s != null && v.idle_s >= 30
           ? ` <span class="stalled">◌ no progress for ${fmtDur(v.idle_s)}</span>`
           : ' <span class="pulse">●</span>') : '') +
     (v.writes != null ? ` <small>(${v.writes} tasks done)</small>` : '') +
@@ -519,7 +522,8 @@ async function refresh() {
     (v.status === 'running'
       ? ` <button class="kill small" onclick="killJob('${k}')">Kill</button>` : '') +
     (['cancelled','error'].includes(v.status)
-      ? ` <button class="small" onclick="resumeJob('${k}','${esc(v.url||'')}')">Resume</button>` : '') +
+      ? ` <button class="small" onclick="resumeJob('${k}','${esc(v.url||'')}')">Resume</button>` +
+        ` <button class="kill small" onclick="deleteRun('${k}')">Delete</button>` : '') +
     '</div>').join('') || 'none';
 
   const runs = await (await fetch('/api/runs')).json();

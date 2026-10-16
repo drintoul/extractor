@@ -4,6 +4,7 @@ import hashlib
 import json
 import os
 import re
+import threading
 from datetime import datetime, timezone
 from urllib.parse import urlsplit
 
@@ -26,6 +27,15 @@ _CLASSIFY_SYSTEM = (
     "text. "
     'Respond ONLY as JSON: {"keep": true|false, "reason": "short reason"}'
 )
+
+
+# Verdict cache keyed by content hash: identical scraped bodies (bot-wall
+# error pages, boilerplate storms) cost ONE LLM call — duplicates wait on the
+# leader's event instead of each classifying. Persists across runs in this
+# process — fine: classification is deterministic (temp=0, fixed seed).
+_vlock = threading.Lock()
+_vcache: dict[str, "Verdict | None"] = {}
+_vwait: dict[str, threading.Event] = {}
 
 
 class Verdict(BaseModel):
@@ -60,14 +70,59 @@ def map_node(state: CorpusState) -> dict:
 def triage_node(state: CorpusState) -> dict:
     accepted, rejected = triage.triage(state["url_inventory"],
                                        SETTINGS.exclude_path_regex)
-    return {"filtered_urls": accepted, "rejected_urls": rejected}
+    return {"filtered_urls": accepted, "rejected_urls": rejected,
+            "batch_cursor": 0}
+
+
+def dispatch_node(state: CorpusState) -> dict:
+    """Advances the fan-out cursor one batch — runs once per superstep, so a
+    kill is honored between batches and completed pages checkpoint per batch."""
+    if cancel.is_cancelled(state["run_id"]):
+        raise cancel.Cancelled()
+    return {"batch_cursor": state["batch_cursor"] + SETTINGS.batch_size}
 
 
 def fan_out(state: CorpusState):
-    if not state["filtered_urls"]:
+    batch = state["filtered_urls"][
+        state["batch_cursor"] - SETTINGS.batch_size:state["batch_cursor"]]
+    if not batch:
         return ["dedupe"]
     return [Send("process_page", {"url": u, "run_id": state["run_id"]})
-            for u in state["filtered_urls"]]
+            for u in batch]
+
+
+def _classify(md: str, url: str) -> tuple["Verdict | None", bool]:
+    """Classify page content, sharing one LLM call across pages whose body is
+    identical. Returns (verdict, cached?) — cached=True when the verdict came
+    from an earlier page with the same text."""
+    h = hashlib.sha256((SETTINGS.llm_model + "\n" + md).encode()).hexdigest()
+    leader = False
+    ev = None
+    with _vlock:
+        if h in _vcache:
+            return _vcache[h], True
+        ev = _vwait.get(h)
+        if ev is None:
+            ev = _vwait[h] = threading.Event()
+            leader = True
+    if not leader:
+        if ev.wait(240) and h in _vcache:
+            return _vcache[h], True
+        leader = True  # timed out or leader vanished — take over the call
+    try:
+        v = clients.chat_json(
+            [{"role": "system", "content": _CLASSIFY_SYSTEM},
+             {"role": "user", "content": f"URL: {url}\n\nCONTENT:\n{md}"}],
+            Verdict)
+    except Exception:
+        v = None
+    if leader:
+        with _vlock:
+            _vcache[h] = v
+            ev = _vwait.pop(h, None)
+        if ev is not None:
+            ev.set()
+    return v, False
 
 
 def process_page_node(task: PageTask) -> dict:
@@ -91,17 +146,16 @@ def process_page_node(task: PageTask) -> dict:
         page.update(status="dropped_thin", reason=f"{wc} words < {SETTINGS.min_words}")
     else:
         truncated = " ".join(md.split()[:3000])
-        verdict = clients.chat_json(
-            [{"role": "system", "content": _CLASSIFY_SYSTEM},
-             {"role": "user", "content": f"URL: {url}\n\nCONTENT:\n{truncated}"}],
-            Verdict,
-        )
+        verdict, cached = _classify(truncated, url)
         if verdict is None:
             page.update(status="review", reason="llm_parse_error")
         elif verdict.keep:
-            page.update(status="kept")
+            page.update(status="kept",
+                        reason="duplicate content — verdict reused" if cached else None)
         else:
-            page.update(status="dropped_llm", reason=verdict.reason[:200])
+            page.update(status="dropped_llm",
+                        reason=verdict.reason[:200] +
+                               (" (duplicate content)" if cached else ""))
 
     if page["status"] in ("kept", "review"):
         page["doc_id"] = hashlib.sha256(md.encode()).hexdigest()

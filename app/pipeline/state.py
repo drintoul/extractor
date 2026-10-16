@@ -26,6 +26,7 @@ class CorpusState(TypedDict):
     catalog_skipped_urls: int  # product-catalog URLs excluded at discovery
     rejected_urls: dict[str, str]  # url -> rejection rule
     filtered_urls: list[str]
+    batch_cursor: int  # filtered_urls already dispatched (batched fan-out)
     # Keyed by URL so parallel fan-out results merge order-independently.
     pages: Annotated[dict[str, PageResult], operator.or_]
     docs: list[dict]

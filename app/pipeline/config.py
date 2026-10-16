@@ -20,6 +20,9 @@ class Settings:
     # optional regex applied to every discovered URL path during triage —
     # rejects e.g. /products/ or /product/ on platforms with no type signal
     exclude_path_regex: str = os.environ.get("EXCLUDE_PATH_REGEX", "")
+    # pages dispatched to the scrape/classify fan-out per superstep — bounds
+    # in-flight work so kills unwind fast and progress commits per batch
+    batch_size: int = int(os.environ.get("BATCH_SIZE", "200"))
     data_dir: str = os.environ.get("DATA_DIR", "./data")
     checkpoint_db: str = os.environ.get("CHECKPOINT_DB", "./checkpoints/corpus.db")
     mongo_uri: str = os.environ.get("MONGO_URI", "mongodb://localhost:27017")

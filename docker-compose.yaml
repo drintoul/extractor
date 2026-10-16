@@ -240,6 +240,11 @@ services:
       EMBED_MODEL: ${EMBED_MODEL}
       LLM_SEED: ${LLM_SEED}
       MIN_WORDS: ${MIN_WORDS}
+      SCRAPE_TIMEOUT_MS: ${SCRAPE_TIMEOUT_MS}
+      MAP_LIMIT: ${MAP_LIMIT}
+      SITEMAP_SKIP_PATTERNS: ${SITEMAP_SKIP_PATTERNS}
+      EXCLUDE_PATH_REGEX: ${EXCLUDE_PATH_REGEX}
+      BATCH_SIZE: ${BATCH_SIZE}
       DATA_DIR: /data
       CHECKPOINT_DB: /checkpoints/corpus.db
       MONGO_URI: mongodb://${MONGO_USER}:${MONGO_PASSWORD}@mongo:27017/?authSource=admin
