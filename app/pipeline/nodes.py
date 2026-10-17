@@ -213,6 +213,8 @@ def chunk_embed_node(state: CorpusState) -> dict:
     catalog_urls = (state.get("catalog_skipped_urls") or 0) + sum(
         1 for r in (state.get("rejected_urls") or {}).values()
         if r == "user-excluded")
+    locale_folded = sum(1 for r in (state.get("rejected_urls") or {}).values()
+                        if r == "locale-fold")
 
     finished_at = datetime.now(timezone.utc)
     started_at = state.get("started_at")
@@ -249,6 +251,7 @@ def chunk_embed_node(state: CorpusState) -> dict:
             "pages_by_status": status_counts,
             "docs": len(state["docs"]),
             "chunks": len(chunks),
+            "locale_folded": locale_folded,
             "catalog_urls_skipped": catalog_urls,
             "catalog_heavy": (catalog_urls >= 50
                               and catalog_urls > len(state["filtered_urls"])),

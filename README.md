@@ -93,6 +93,8 @@ The `app` service exposes a web UI and JSON API on `APP_PORT`:
 | `GET /api/chunks?run_id=…[&doc_id=…]` | Chunk text/metadata (embeddings excluded) |
 | `POST /api/runs/{run_id}/keep?url=…` | Manual keep: chunks+embeds the page into the corpus |
 | `POST /api/runs/{run_id}/remove?url=…` | Manual remove: pulls the page's chunks out of the corpus |
+| `GET /api/runs/{run_id}/overrides` | List stored keep/remove curation for the run's site |
+| `DELETE /api/runs/{run_id}/overrides` | Forget all site curation — takes effect on the next run |
 | `GET /api/runs/{run_id}/export.pkl` / `.jsonl` | Self-describing corpus export (metadata + chunks) |
 
 Resubmitting an existing `run_id` resumes its checkpoint instead of restarting —
@@ -196,7 +198,11 @@ flowchart TD
 ```
 
 - `triage`: drops tag/author/category/pagination/cart/login paths, binary
-  extensions, tracking params — before any paid scrape
+  extensions, tracking params — before any paid scrape. Also **locale-folds**:
+  URLs differing only by a leading locale segment (`/en/…`, `/usa/…`, `/gbr/…`)
+  collapse to one representative (naked path preferred, then English locales),
+  since per-locale copies defeat content dedupe — rejected as `locale-fold`,
+  counted in the manifest as `locale_folded`
 - `process_page`: `onlyMainContent` scrape → rule-based denoise → thin-page
   floor (`MIN_WORDS`) → Qwen keep/drop verdict (judge, never rewriter)
 - `dedupe`: MinHash+LSH at 0.85 similarity

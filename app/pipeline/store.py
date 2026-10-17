@@ -3,6 +3,7 @@ so re-running a pipeline (or resuming a checkpoint) is idempotent."""
 import hashlib
 import json
 import os
+import re
 from datetime import datetime, timezone
 from urllib.parse import urlsplit
 
@@ -114,6 +115,36 @@ def _page_pid(run_id: str, url: str) -> str:
     return f"{run_id}:{hashlib.sha256(url.encode()).hexdigest()[:16]}"
 
 
+def _patch_manifest_counts(mpath: str, inc: dict) -> None:
+    """Apply $inc-style count deltas to the on-disk manifest file."""
+    if not os.path.exists(mpath):
+        return
+    with open(mpath) as f:
+        m = json.load(f)
+    for k, v in inc.items():
+        parts = k.split(".")
+        node = m
+        for p in parts[1:-1]:
+            node = node.setdefault(p, {})
+        node[parts[-1]] = node.get(parts[-1], 0) + v
+    with open(mpath, "w") as f:
+        json.dump(m, f, indent=2)
+
+
+def _stash_orig(run_id: str, url: str, old_status: str) -> None:
+    """Capture the classifier verdict before a manual override rewrites it —
+    lets 'clear curation' restore the page's original status/reason. First
+    mutation wins; later re-overrides must not overwrite the stash."""
+    db = get_db()
+    pid = _page_pid(run_id, url)
+    page = db.pages.find_one({"_id": pid},
+                             {"reason": 1, "orig_status": 1}) or {}
+    if "orig_status" not in page:
+        db.pages.update_one({"_id": pid},
+                            {"$set": {"orig_status": old_status,
+                                      "orig_reason": page.get("reason")}})
+
+
 def apply_keep(run_id: str, url: str, title: str | None, markdown: str,
                old_status: str, corpus_path: str,
                reason: str | None = None) -> dict:
@@ -155,6 +186,7 @@ def apply_keep(run_id: str, url: str, title: str | None, markdown: str,
             for c in chunks:
                 f.write(json.dumps(c, ensure_ascii=False) + "\n")
 
+    _stash_orig(run_id, url, old_status)
     db.pages.update_one(
         {"_id": _page_pid(run_id, url)},
         {"$set": {"status": "kept", "doc_id": doc_id,
@@ -174,6 +206,8 @@ def apply_remove(run_id: str, url: str, doc_id: str, old_status: str,
     """Pull a page's doc/chunks out of the corpus. Returns the $inc dict."""
     db = get_db()
     doc = db.docs.find_one({"_id": doc_id})
+    _stash_orig(run_id, url, old_status)
+    stash = {"removed_doc_id": doc_id}
     n_chunks = doc_removed = 0
     # only touch doc/chunks if this page is the doc's canonical source —
     # a dedupe loser shares doc_id with the surviving sibling's chunks
@@ -187,6 +221,9 @@ def apply_remove(run_id: str, url: str, doc_id: str, old_status: str,
             db.docs.update_one({"_id": doc_id},
                                {"$pull": {"run_ids": run_id}})
         else:
+            # canonical doc is being deleted — snapshot its markdown on the
+            # page so 'clear curation' can re-chunk it without a re-scrape
+            stash["removed_md"] = doc.get("markdown")
             db.docs.delete_one({"_id": doc_id})
         doc_removed = 1
         if doomed and os.path.exists(corpus_path):
@@ -199,7 +236,8 @@ def apply_remove(run_id: str, url: str, doc_id: str, old_status: str,
     db.pages.update_one(
         {"_id": _page_pid(run_id, url)},
         {"$set": {"status": "removed", "doc_id": None,
-                  "reason": reason or f"manually removed — was {old_status}"}})
+                  "reason": reason or f"manually removed — was {old_status}",
+                  **stash}})
     return {f"counts.pages_by_status.{old_status}": -1,
             "counts.pages_by_status.removed": 1,
             "counts.chunks": -n_chunks,
@@ -236,16 +274,112 @@ def apply_overrides(state: dict) -> None:
     if inc:
         db.runs.update_one({"_id": run_id}, {"$inc": inc})
         # keep the on-disk manifest in sync with adjusted counts
-        mpath = os.path.join(os.path.dirname(corpus_path) or ".",
-                             f"manifest-{run_id}.json")
-        if os.path.exists(mpath):
-            with open(mpath) as f:
-                m = json.load(f)
-            for k, v in inc.items():
-                parts = k.split(".")
-                node = m
-                for p in parts[1:-1]:
-                    node = node.setdefault(p, {})
-                node[parts[-1]] = node.get(parts[-1], 0) + v
-            with open(mpath, "w") as f:
-                json.dump(m, f, indent=2)
+        _patch_manifest_counts(
+            os.path.join(os.path.dirname(corpus_path) or ".",
+                         f"manifest-{run_id}.json"), inc)
+
+
+def _orig_verdict(page: dict, action: str) -> tuple[str, str | None]:
+    """Best-effort original classifier verdict for a page: the stashed
+    orig_* fields first, then parse 'was <status>' from a legacy override
+    reason, then a safe default for the action."""
+    if page.get("orig_status"):
+        return page["orig_status"], page.get("orig_reason")
+    m = re.search(r"was (\w+)", page.get("reason") or "")
+    if m:
+        return m.group(1), None
+    return ("review" if action == "keep" else "kept"), \
+        "curation cleared — original verdict unknown"
+
+
+def revert_override(run_id: str, ov: dict, corpus_path: str) -> dict:
+    """Undo one stored keep/remove on this run's page — restores corpus rows
+    where possible and the page's original classifier verdict. Returns a
+    result dict with the manifest $inc deltas."""
+    db = get_db()
+    url = ov["url"]
+    pid = _page_pid(run_id, url)
+    page = db.pages.find_one({"_id": pid})
+    if not page:
+        return {}
+    orig, orig_reason = _orig_verdict(page, ov["action"])
+    unset = {"orig_status": "", "orig_reason": "",
+             "removed_doc_id": "", "removed_md": ""}
+
+    if ov["action"] == "keep" and page["status"] == "kept" \
+            and page.get("doc_id"):
+        inc = apply_remove(run_id, url, page["doc_id"], "kept", corpus_path)
+        # apply_remove left status=removed; land on the original verdict
+        inc[f"counts.pages_by_status.removed"] = \
+            inc.get("counts.pages_by_status.removed", 0) - 1
+        inc[f"counts.pages_by_status.{orig}"] = \
+            inc.get(f"counts.pages_by_status.{orig}", 0) + 1
+        db.pages.update_one({"_id": pid},
+                            {"$set": {"status": orig, "reason": orig_reason},
+                             "$unset": unset})
+        return {"inc": inc, "reverted": 1}
+
+    if ov["action"] == "remove" and page["status"] == "removed":
+        md = page.get("removed_md") or ""
+        doc_id = page.get("removed_doc_id")
+        if not md and doc_id:  # shared doc survived — markdown still in docs
+            md = (db.docs.find_one({"_id": doc_id}, {"markdown": 1})
+                  or {}).get("markdown") or ""
+        if doc_id and not md:
+            # canonical doc was deleted before snapshotting existed — content
+            # is unrecoverable without a re-scrape; leave status, fix the why
+            db.pages.update_one(
+                {"_id": pid},
+                {"$set": {"reason":
+                          "curation cleared — content deleted; re-run to "
+                          "restore"}})
+            return {"unrestorable": 1}
+        if not doc_id and not md:
+            # dedupe loser — apply_remove never touched corpus rows
+            db.pages.update_one({"_id": pid},
+                                {"$set": {"status": orig,
+                                          "reason": orig_reason},
+                                 "$unset": unset})
+            return {"inc": {"counts.pages_by_status.removed": -1,
+                            f"counts.pages_by_status.{orig}": 1},
+                    "reverted": 1}
+        inc = apply_keep(run_id, url, page.get("title"), md, "removed",
+                         corpus_path, reason=orig_reason)
+        if orig != "kept":  # apply_keep lands on kept
+            inc["counts.pages_by_status.kept"] -= 1
+            inc[f"counts.pages_by_status.{orig}"] = \
+                inc.get(f"counts.pages_by_status.{orig}", 0) + 1
+        db.pages.update_one({"_id": pid},
+                            {"$set": {"status": orig,
+                                      "reason": orig_reason},
+                             "$unset": unset})
+        return {"inc": inc, "reverted": 1}
+    return {}
+
+
+def revert_site_overrides(seed_url: str) -> dict:
+    """Revert every stored override across all runs of this site, then forget
+    the overrides. Re-runs of the site will classify those pages fresh."""
+    db = get_db()
+    ovs = list(db.overrides.find({"seed_url": seed_url}))
+    cleared = reverted = unrestorable = 0
+    for run in db.runs.find({"seed_url": seed_url}, {"_id": 1}):
+        run_id = run["_id"]
+        corpus_path = os.path.join(SETTINGS.data_dir,
+                                   f"corpus-{run_id}.jsonl")
+        inc: dict[str, int] = {}
+        for ov in ovs:
+            r = revert_override(run_id, ov, corpus_path)
+            reverted += r.get("reverted", 0)
+            unrestorable += r.get("unrestorable", 0)
+            for k, v in (r.get("inc") or {}).items():
+                inc[k] = inc.get(k, 0) + v
+        if inc:
+            db.runs.update_one({"_id": run_id}, {"$inc": inc})
+            _patch_manifest_counts(
+                os.path.join(SETTINGS.data_dir,
+                             f"manifest-{run_id}.json"), inc)
+    if ovs:
+        cleared = db.overrides.delete_many({"seed_url": seed_url}).deleted_count
+    return {"seed_url": seed_url, "cleared": cleared,
+            "reverted": reverted, "unrestorable": unrestorable}

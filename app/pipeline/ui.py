@@ -183,6 +183,18 @@ def _writes_count(run_id: str) -> int | None:
     return None
 
 
+@app.get("/api/settings")
+def get_settings():
+    return {"min_words": SETTINGS.min_words,
+            "map_limit": SETTINGS.map_limit,
+            "batch_size": SETTINGS.batch_size,
+            "scrape_timeout_ms": SETTINGS.scrape_timeout_ms,
+            "exclude_path_regex": SETTINGS.exclude_path_regex,
+            "sitemap_skip_patterns": SETTINGS.sitemap_skip_patterns,
+            "llm_model": SETTINGS.llm_model,
+            "embed_model": SETTINGS.embed_model}
+
+
 @app.get("/api/jobs")
 def jobs():
     now = time.time()
@@ -261,6 +273,28 @@ def remove_page(run_id: str, url: str = Query(...)):
     if run and run.get("seed_url"):
         store.record_override(run["seed_url"], run_id, url, "remove")
     return {"status": "removed", **inc}
+
+
+@app.get("/api/runs/{run_id}/overrides")
+def list_overrides(run_id: str):
+    run = get_db().runs.find_one({"_id": run_id}, {"seed_url": 1}) or {}
+    ovs = [{"url": o["url"], "action": o["action"], "at": o.get("at")}
+           for o in get_db().overrides.find(
+               {"seed_url": run.get("seed_url")}, {"_id": 0})]
+    return {"seed_url": run.get("seed_url"), "overrides": ovs}
+
+
+@app.delete("/api/runs/{run_id}/overrides")
+def clear_overrides(run_id: str):
+    """Forget all stored keep/remove curation for this run's site (keyed by
+    canonical seed_url) and revert each overridden page to its original
+    classifier verdict — pulls chunks for kept-overrides, restores them for
+    removed-overrides where the content is still available."""
+    run = get_db().runs.find_one({"_id": run_id}, {"seed_url": 1}) or {}
+    seed = run.get("seed_url")
+    if not seed:
+        raise HTTPException(404, "run not found")
+    return store.revert_site_overrides(seed)
 
 
 def _corpus_payload(run_id: str) -> dict:
@@ -402,6 +436,7 @@ _PAGE = """<!doctype html>
   .pulse{color:#2d5;animation:pl 1.2s infinite}
   @keyframes pl{50%{opacity:.15}}
   .stalled{color:#fa0}
+  .sub{color:#999;font-size:.85rem;margin:-.8rem 0 1rem}
   button.kill{background:#c44}
   button.small{padding:.2rem .6rem;font-size:.8rem}
   a.btn{display:inline-block;padding:.2rem .6rem;font-size:.8rem;
@@ -421,9 +456,15 @@ _PAGE = """<!doctype html>
   .chunk .meta{color:#7ab;display:block;margin-bottom:.4rem;font-size:.75rem}
 </style></head><body>
 <h1>extractor</h1>
+<p class="sub">Reads every page of a website, throws out the junk, and
+saves the useful content as a knowledge base a chatbot can answer
+questions from — all running on your own machine.</p>
 <form id="f"><input id="url" placeholder="https://docs.example.com" required>
 <button>Run</button></form>
 <div id="msg"></div>
+
+<details id="filters"><summary>How it works</summary><div id="filterbody">
+loading…</div></details>
 
 <h2>Jobs</h2><div id="jobs">none</div>
 <h2>Runs</h2><div id="runs">none</div>
@@ -449,7 +490,8 @@ const RULE_LABELS = {
   'binary-or-feed-extension': 'file or feed — pdf, xml, image, css, js…',
   'non-http-scheme': 'not an http(s) URL',
   'user-excluded': 'excluded by EXCLUDE_PATH_REGEX',
-  'date-archive': 'date archive listing — duplicate of posts'
+  'date-archive': 'date archive listing — duplicate of posts',
+  'locale-fold': 'locale duplicate — same page under a different language/country path'
 };
 const statusLabel = s => STATUS_LABELS[s] || s;
 const reasonLabel = r => RULE_LABELS[r] || r || '';
@@ -470,6 +512,70 @@ const fmtDur = s => {
   const h = Math.floor(t / 3600), m = Math.floor(t % 3600 / 60), r = t % 60;
   return h ? `${h}h ${m}m` : m ? `${m}m ${r}s` : `${r}s`;
 };
+
+async function renderFilters() {
+  const s = await (await fetch('/api/settings')).json();
+  const urlRules = [
+    'Strips tracking parameters from URLs (utm_*, fbclid, gclid, ref, share)',
+    'Skips binary and feed files — images, audio, video, PDFs, archives, ' +
+      'office documents, fonts, CSS/JS/XML/JSON',
+    'Skips site-machinery paths — tags, authors, categories, pagination, ' +
+      'comments, cart, checkout, search, login/register, account, share, ' +
+      'print, AMP, wishlist, order status, WordPress internals',
+    'Skips bare date listings like /2024 or /2024/05 — dated posts are kept',
+    'Collapses per-locale copies of a page (/en/, /usa/, /gbr/…) to one ' +
+      'representative — un-prefixed or English version preferred',
+  ];
+  if (s.sitemap_skip_patterns)
+    urlRules.push(`Ignores sitemaps that look like product catalogs ` +
+      `— sitemaps matching "${esc(s.sitemap_skip_patterns)}"`);
+  if (s.exclude_path_regex)
+    urlRules.push(`Skips every URL whose path contains ` +
+      `"${esc(s.exclude_path_regex)}"`);
+  urlRules.push(`Discovers at most ${s.map_limit.toLocaleString()} URLs per site`);
+  const contentRules = [
+    `Drops pages under ${s.min_words} words after navigation and ` +
+      `boilerplate are stripped`,
+    `${esc(s.llm_model)} reads each page and keeps only ones that could ` +
+      `answer a visitor's question — menus, products, services, prices, ` +
+      `events, hours, locations, directions, contact info, about, team, ` +
+      `FAQs, guides, and policies that affect customers. It drops ` +
+      `navigation stubs, login/admin screens, error pages, empty ` +
+      `templates, cookie/legal boilerplate, and galleries without text ` +
+      `(deterministic — temperature 0, fixed seed)`,
+    'Identical page bodies share one verdict — duplicates are counted, ' +
+      'not re-classified',
+    'Near-duplicate pages (85% similar) collapse into one document',
+    `Pages processed in batches of ${s.batch_size}`,
+    'Every keep/drop decision can be changed by hand — click a run, use ' +
+      'the keep/remove buttons in the page audit. Your choices are saved ' +
+      'per site and re-applied on future runs until cleared',
+  ];
+  $('filterbody').innerHTML =
+    '<p>Paste a website address above and hit Run. The extractor finds ' +
+    'every page on the site, throws out junk pages (logins, carts, ' +
+    'file downloads, duplicates), reads what is left, and keeps only ' +
+    'content that could answer a real visitor question — menus, prices, ' +
+    'hours, services, FAQs, that kind of thing. Everything is checked ' +
+    'and stored on your own machine; nothing goes to a third party. ' +
+    'Watch progress under Jobs — a green dot means it is working. When ' +
+    'a run finishes it moves to Runs; click it to open a page-by-page ' +
+    'audit where you can keep or remove anything the filters got ' +
+    'wrong, then download the result as a knowledge base for your ' +
+    'chatbot. Details on the rules and export formats below.</p>' +
+    '<b>URL rules — applied before anything is scraped</b><ul>' +
+    urlRules.map(r => `<li>${r}</li>`).join('') + '</ul>' +
+    '<b>Content rules — applied after scraping</b><ul>' +
+    contentRules.map(r => `<li>${r}</li>`).join('') + '</ul>' +
+    '<b>Exports — two formats for the same corpus</b><ul>' +
+    '<li><code>.jsonl</code> — plain text, one chunk per line: easy to ' +
+      'open, skim, diff between runs, or stream into other tools</li>' +
+    '<li><code>.pkl</code> — ready-to-load Python object with everything ' +
+      'in one file (metadata, settings, your keep/remove choices, chunks ' +
+      'and exact embeddings) for feeding straight into RAG code</li>' +
+    '</ul>';
+}
+renderFilters();
 
 async function post(url, body) {
   return (await fetch(url, {method:'POST',
@@ -493,6 +599,20 @@ async function deleteRun(id) {
   await fetch(`/api/runs/${id}`, {method:'DELETE'});
   $('detail').innerHTML = '';
   refresh();
+}
+async function clearCuration(id) {
+  if (!confirm(`Forget all keep/remove curation for this site?\n\n` +
+               `Each overridden page reverts to its original classifier ` +
+               `verdict — kept pages pull their chunks, removed pages are ` +
+               `restored where the content is still available. Applies to ` +
+               `every run of this site, not just this one.`)) return;
+  const r = await (await fetch(`/api/runs/${id}/overrides`,
+                               {method:'DELETE'})).json();
+  $('msg').textContent = `cleared ${r.cleared} override(s) for ${r.seed_url}` +
+    ` — reverted ${r.reverted} page(s)` +
+    (r.unrestorable ? ` (${r.unrestorable} unrestorable — content gone, ` +
+     `re-run to restore)` : '');
+  detail(id);
 }
 document.getElementById('f').onsubmit = async e => {
   e.preventDefault();
@@ -554,8 +674,8 @@ async function refresh() {
     return `<div class="run${r.run_id===_sel?' sel':''}" onclick="detail('${r.run_id}')">` +
       `<b>${r.run_id}</b> ` +
       `<button class="small" onclick="event.stopPropagation();rerunRun('${r.run_id}')">Re-run</button> ` +
-      `<a class="small btn" href="/api/runs/${r.run_id}/export.pkl" onclick="event.stopPropagation()">pkl</a> ` +
       `<a class="small btn" href="/api/runs/${r.run_id}/export.jsonl" onclick="event.stopPropagation()">jsonl</a> ` +
+      `<a class="small btn" href="/api/runs/${r.run_id}/export.pkl" onclick="event.stopPropagation()">pkl</a> ` +
       `<button class="kill small" onclick="event.stopPropagation();deleteRun('${r.run_id}')">Delete</button>` +
       `<br>${esc(r.seed_url||'')}<br>` +
       `${line1}<br><small>${line2}</small>${flag}${empty}</div>`;
@@ -581,21 +701,26 @@ async function detail(runId) {
   _sel = runId; refresh();
   const ps = await (await fetch(`/api/pages?run_id=${runId}`)).json();
   const cs = await (await fetch(`/api/chunks?run_id=${runId}`)).json();
+  const ov = await (await fetch(`/api/runs/${runId}/overrides`)).json();
   ps.sort((a,b) => (STATUS_RANK[a.status]??9)-(STATUS_RANK[b.status]??9)
+                   || (b.word_count||0)-(a.word_count||0)
                    || a.url.localeCompare(b.url));
   const dupes = _runsById[runId]?.counts?.dupe_pages;
-  $('detail').innerHTML = `<h2>${runId}</h2>
+  $('detail').innerHTML = `<h2>${runId}` +
+    (ov.overrides.length
+      ? ` <button class="small kill" onclick="clearCuration('${runId}')">clear site curation (${ov.overrides.length})</button>`
+      : '') + `</h2>
     <details open><summary>Page audit (${ps.length} URLs)</summary>` +
     (dupes ? `<p><small>${dupes} pages with identical content collapsed — ` +
             `only the first is audited; duplicates shared its verdict ` +
             `and are counted, not listed.</small></p>` : '') + `<table>
-    <tr><th>status</th><th>words</th><th>url</th><th>why</th><th></th></tr>` +
-    ps.map(p => `<tr><td class="${p.status} nw">${statusLabel(p.status)}</td>
-      <td class="nw">${p.word_count||''}</td><td class="u"><a href="${esc(p.url).replace(/"/g,'%22')}" target="_blank" rel="noopener">${esc(p.url)}</a></td>
-      <td>${esc(reasonLabel(p.reason))}</td>
-      <td class="nw">${p.status==='kept'
+    <tr><th></th><th>words</th><th>url</th><th>why</th><th>status</th></tr>` +
+    ps.map(p => `<tr><td class="nw">${p.status==='kept'
         ? `<button class="small kill" onclick="removePage('${runId}',this)">remove</button>`
         : `<button class="small" onclick="keepPage('${runId}',this)">keep</button>`}</td>
+      <td class="nw">${p.word_count||''}</td><td class="u"><a href="${esc(p.url).replace(/"/g,'%22')}" target="_blank" rel="noopener">${esc(p.url)}</a></td>
+      <td>${esc(reasonLabel(p.reason))}</td>
+      <td class="${p.status} nw">${statusLabel(p.status)}</td>
       </tr>`).join('') + `</table></details>
     <details><summary>Sample chunks (${Math.min(5, cs.length)} of ${cs.length})</summary>` +
     (cs.slice(0,5).map(c =>
