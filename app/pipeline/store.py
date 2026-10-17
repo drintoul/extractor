@@ -52,6 +52,7 @@ def save_run(state: dict, corpus_path: str) -> dict:
             upsert=True,
         )
         for url, p in state["pages"].items()
+        if not p.get("dupe")  # identical-body pages -> count only, no row
     ] + [
         UpdateOne(
             {"_id": f"{run_id}:{hashlib.sha256(url.encode()).hexdigest()[:16]}"},

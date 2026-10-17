@@ -10,6 +10,7 @@ class PageResult(TypedDict):
     word_count: int
     doc_id: Optional[str]  # sha256 of cleaned markdown; None when dropped
     reason: Optional[str]
+    dupe: bool  # body identical to an earlier page — verdict reused, not audited
 
 
 class PageTask(TypedDict):

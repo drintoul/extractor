@@ -130,7 +130,7 @@ def process_page_node(task: PageTask) -> dict:
         raise cancel.Cancelled()
     url = task["url"]
     page = PageResult(url=url, status="", title=None, markdown="",
-                      word_count=0, doc_id=None, reason=None)
+                      word_count=0, doc_id=None, reason=None, dupe=False)
     try:
         data = clients.scrape_page(url)
     except Exception as e:
@@ -147,6 +147,7 @@ def process_page_node(task: PageTask) -> dict:
     else:
         truncated = " ".join(md.split()[:3000])
         verdict, cached = _classify(truncated, url)
+        page["dupe"] = cached
         if verdict is None:
             page.update(status="review", reason="llm_parse_error")
         elif verdict.keep:
@@ -200,8 +201,12 @@ def chunk_embed_node(state: CorpusState) -> dict:
             f.write(json.dumps(c, ensure_ascii=False) + "\n")
 
     status_counts: dict[str, int] = {}
+    dupe_pages = 0
     for p in state["pages"].values():
-        status_counts[p["status"]] = status_counts.get(p["status"], 0) + 1
+        if p.get("dupe"):
+            dupe_pages += 1
+        else:
+            status_counts[p["status"]] = status_counts.get(p["status"], 0) + 1
 
     # Fit signal: product-catalog URLs excluded pre-scrape (skipped sitemaps
     # + user-excluded path patterns). Flag when they outnumber real content.
@@ -230,11 +235,17 @@ def chunk_embed_node(state: CorpusState) -> dict:
             "scrape_timeout_ms": SETTINGS.scrape_timeout_ms,
             "sitemap_skip_patterns": SETTINGS.sitemap_skip_patterns,
             "exclude_path_regex": SETTINGS.exclude_path_regex,
+            "batch_size": SETTINGS.batch_size,
         },
         "counts": {
             "urls_mapped": len(state["url_inventory"]),
             "urls_rejected": len(state["rejected_urls"]),
             "urls_filtered": len(state["filtered_urls"]),
+            "dupe_pages": dupe_pages,
+            # identical-body storm = bot wall / error page served for most of
+            # the site (e.g. WAF returns a branded 404 page to scrapers)
+            "bot_walled": (dupe_pages >= 50
+                           and dupe_pages >= sum(status_counts.values())),
             "pages_by_status": status_counts,
             "docs": len(state["docs"]),
             "chunks": len(chunks),

@@ -527,6 +527,7 @@ async function refresh() {
     '</div>').join('') || 'none';
 
   const runs = await (await fetch('/api/runs')).json();
+  _runsById = Object.fromEntries(runs.map(r => [r.run_id, r]));
   $('runs').innerHTML = runs.map(r => {
     const c = r.counts || {};
     const st = c.pages_by_status || {};
@@ -534,14 +535,19 @@ async function refresh() {
       `took ${fmtDur(r.duration_seconds)}<br>` +
       `discovered: ${c.urls_mapped||0} · ` +
       `skipped by URL rules: ${c.urls_rejected||0} · ` +
-      `scraped: ${c.urls_filtered||0}`;
+      `scraped: ${c.urls_filtered||0}` +
+      (c.dupe_pages ? ` · dupes collapsed: ${c.dupe_pages}` : '');
     const line2 = Object.entries(st)
       .map(([k,v]) => `${statusLabel(k)}: ${v}`).join(' · ') +
       ` · documents: ${c.docs||0} · chunks: ${c.chunks||0}`;
-    const flag = c.catalog_heavy
+    const flag = (c.catalog_heavy
       ? `<br><span class="flag">large product catalog — ` +
         `${c.catalog_urls_skipped} product URLs skipped. ` +
-        `Company may be a poor fit for a RAG chatbot offering.</span>` : '';
+        `Company may be a poor fit for a RAG chatbot offering.</span>` : '') +
+      (c.bot_walled
+      ? `<br><span class="flag">bot-walled — ${c.dupe_pages} pages served ` +
+        `identical content (likely a scraper block/error page). ` +
+        `Site may not be extractable without stealth/proxies.</span>` : '');
     const empty = (c.docs||0) === 0
       ? `<br><span class="empty">Nothing kept — corpus is empty. ` +
         `Click to see why each URL was dropped.</span>` : '';
@@ -570,15 +576,19 @@ async function removePage(runId, btn) {
   detail(runId); refresh();
 }
 
-let _sel = null;
+let _sel = null, _runsById = {};
 async function detail(runId) {
   _sel = runId; refresh();
   const ps = await (await fetch(`/api/pages?run_id=${runId}`)).json();
   const cs = await (await fetch(`/api/chunks?run_id=${runId}`)).json();
   ps.sort((a,b) => (STATUS_RANK[a.status]??9)-(STATUS_RANK[b.status]??9)
                    || a.url.localeCompare(b.url));
+  const dupes = _runsById[runId]?.counts?.dupe_pages;
   $('detail').innerHTML = `<h2>${runId}</h2>
-    <details open><summary>Page audit (${ps.length} URLs)</summary><table>
+    <details open><summary>Page audit (${ps.length} URLs)</summary>` +
+    (dupes ? `<p><small>${dupes} pages with identical content collapsed — ` +
+            `only the first is audited; duplicates shared its verdict ` +
+            `and are counted, not listed.</small></p>` : '') + `<table>
     <tr><th>status</th><th>words</th><th>url</th><th>why</th><th></th></tr>` +
     ps.map(p => `<tr><td class="${p.status} nw">${statusLabel(p.status)}</td>
       <td class="nw">${p.word_count||''}</td><td class="u"><a href="${esc(p.url).replace(/"/g,'%22')}" target="_blank" rel="noopener">${esc(p.url)}</a></td>

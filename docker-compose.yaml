@@ -22,7 +22,7 @@ name: extractor
 x-firecrawl-env: &firecrawl-env
   REDIS_URL: redis://redis:6379
   REDIS_RATE_LIMIT_URL: redis://redis:6379
-  PLAYWRIGHT_MICROSERVICE_URL: http://firecrawl-playwright:3000/scrape
+  PLAYWRIGHT_MICROSERVICE_URL: ${PLAYWRIGHT_MICROSERVICE_URL}
   POSTGRES_USER: ${POSTGRES_USER}
   POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
   POSTGRES_DB: ${POSTGRES_DB}
@@ -141,6 +141,27 @@ services:
     environment:
       PORT: "3000"
       BLOCK_MEDIA: "true"             # skip images/fonts — faster, less bandwidth
+      MAX_CONCURRENT_PAGES: ${CRAWL_CONCURRENT_REQUESTS}
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    tmpfs:
+      - /tmp/.cache:noexec,nosuid,size=1g
+
+  # ---------------------------------------------------------------------------
+  # stealth-playwright — anti-bot-resistant renderer. Same /scrape contract as
+  # firecrawl-playwright but uses patchright (patched CDP runtime) + REAL
+  # headed Google Chrome under xvfb. Slower and heavier — point
+  # PLAYWRIGHT_MICROSERVICE_URL at it when a site bot-walls the stock service.
+  # ---------------------------------------------------------------------------
+  stealth-playwright:
+    build: ./stealth-playwright
+    container_name: extractor-stealth-playwright
+    restart: unless-stopped
+    environment:
+      PORT: "3000"
+      BLOCK_MEDIA: "true"
       MAX_CONCURRENT_PAGES: ${CRAWL_CONCURRENT_REQUESTS}
     security_opt:
       - no-new-privileges:true

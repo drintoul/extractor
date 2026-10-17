@@ -23,7 +23,8 @@ Everything runs locally in Docker:
 | `ollama` | `ollama/ollama` | qwen2.5:14b (Q4_K_M) classify + bge-large-en-v1.5 embed, GPU |
 | `ollama-pull` | `ollama/ollama` | one-shot model puller (~9 GB LLM + 671 MB embed) |
 | `firecrawl-api` | `ghcr.io/firecrawl/firecrawl` | map / scrape / crawl / extract API (internal only) |
-| `firecrawl-playwright` | `ghcr.io/firecrawl/playwright-service` | JS rendering |
+| `firecrawl-playwright` | `ghcr.io/firecrawl/playwright-service` | JS rendering (stock, headless) |
+| `stealth-playwright` | local build `./stealth-playwright` | JS rendering (real headed Chrome + patchright under Xvfb — slower, defeats some anti-bot walls) |
 | `redis` / `rabbitmq` / `nuq-postgres` | official | Firecrawl queue backend |
 | `mongo` | `mongo:7` | corpus store (internal only) |
 | `app` | `./app` | LangGraph pipeline + web UI on :8090 |
@@ -62,6 +63,7 @@ fallbacks — a missing key fails fast.
 
 | Variable | Purpose |
 |---|---|
+| `PLAYWRIGHT_MICROSERVICE_URL` | JS renderer Firecrawl calls — `http://firecrawl-playwright:3000/scrape` (stock) or `http://stealth-playwright:3000/scrape` (slower, real Chrome, better vs. bot walls) |
 | `LLM_MODEL` | Ollama tag for keep/drop classification + Firecrawl `/extract` |
 | `EMBED_MODEL` | Ollama embedding tag (`bge-large` = bge-large-en-v1.5, 1024-dim) |
 | `LLM_SEED` | Fixed seed; combined with `temperature=0`/`top_k=1` for reproducible verdicts |
@@ -267,3 +269,10 @@ docker compose up -d --build
   Firecrawl API is internal-only; nothing publishes it to the host.
 - `BLOCK_MEDIA=true` on the Playwright service saves bandwidth; flip it off if
   a target site needs images to render content.
+- `stealth-playwright` is a drop-in replacement for the stock renderer: real
+  headed Google Chrome (not Playwright's Chromium) patched by `patchright`,
+  running under Xvfb. Point `PLAYWRIGHT_MICROSERVICE_URL` at it when a site
+  bot-walls the stock service (verified on royalcaribbean.com). It is slower
+  and heavier per page — it is a mitigation, not a guarantee; WAFs can still
+  block on IP reputation, TLS fingerprint, or behavioral signals, which need
+  residential proxies or site-specific handling.
